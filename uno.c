@@ -125,6 +125,9 @@ int main() {
                 }
             }
         }
+        else if (yes_no == 'N'){
+            break;
+        }
     }
 
     // sort the dice array, ascending
