@@ -60,6 +60,9 @@ char yes_no;
 // amount of dice to reroll
 int reroll_amount;
 
+// for small straight and full straight, counting the number that are in sequential order
+int counter;
+
 int main() {
     srand(time(NULL));
 
@@ -174,41 +177,77 @@ int main() {
     // full house
     if(((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) && p_dice[3] == p_dice[4]) || (p_dice[0] == p_dice[1] && (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4]))){
         for (int i = 0; i <= 4; i++) {
-            scoring[7][2] += p_dice[i];
+            scoring[9][2] += p_dice[i];
         }
     }
 
-    // small straight
+    // small straight (1-2-3-4, 2-3-4-5, 3-4-5-6)
+    counter = 0;
+    for (int i = 0; i <= 4; i++) {
+        if(p_dice[i] == p_dice[i + 1] - 1){
+            counter += 1;
+        }
+    }
+    if(counter >= 4){
+        scoring[10][2] += 30;
+    }
+
+    // full straight (1-2-3-4-5, 2-3-4-5-6)
+    counter = 0;
+    for (int i = 0; i <= 4; i++) {
+        if(p_dice[i] == p_dice[i + 1] - 1){
+            counter += 1;
+        }
+    }
+    if(counter == 5){
+        scoring[11][2] += 30;
+    }
+
+    // yahtzee
+    counter = 0;
+    for (int i = 0; i <= 4; i++) {
+        if(p_dice[i] == p_dice[i + 1]){
+            counter += 1;
+        }
+    }
+    if(counter == 5){
+        scoring[12][2] += 50;
+    }
+
+    // chance
+    for (int i = 0; i <= 4; i++) {
+        scoring[13][2] += p_dice[i];
+    }
 
     printf("\nPlease select where you'd like to score...");
     printf("\nUpper Section");
     if(scoring[0][1] != 1)
-        printf("\n1. Aces            | Possible score: ");
+        printf("\n1. Aces            | Possible score: %d", scoring[0][2]);
     if(scoring[1][1] != 1)
-        printf("\n2. Twos            | Possible score: ");
+        printf("\n2. Twos            | Possible score: %d", scoring[1][2]);
     if(scoring[2][1] != 1)
-        printf("\n3. Threes          | Possible score: ");
+        printf("\n3. Threes          | Possible score: %d", scoring[2][2]);
     if(scoring[3][1] != 1)
-        printf("\n4. Fours           | Possible score: ");
+        printf("\n4. Fours           | Possible score: %d", scoring[3][2]);
     if(scoring[4][1] != 1)
-        printf("\n5. Fives           | Possible score: ");
+        printf("\n5. Fives           | Possible score: %d", scoring[4][2]);
     if(scoring[5][1] != 1)
-        printf("\n6. Sixes           | Possible score: ");
+        printf("\n6. Sixes           | Possible score: %d", scoring[5][2]);
     printf("\nLower Section");
     if(scoring[7][1] != 1)
-        printf("\n7. Three-of-a-Kind | Possible score: ");
+        printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[7][2]);
     if(scoring[8][1] != 1)
-        printf("\n8. Four-of-a-Kind  | Possible score: ");
+        printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[8][2]);
     if(scoring[9][1] != 1)
-        printf("\n9. Full House      | Possible score: ");
+        printf("\n9. Full House      | Possible score: %d", scoring[9][2]);
     if(scoring[10][1] != 1)
-        printf("\n10. Small Straight | Possible score: ");
+        printf("\n10. Small Straight | Possible score: %d", scoring[10][2]);
     if(scoring[11][1] != 1)
-        printf("\n11. Large Straight | Possible score: ");
+        printf("\n11. Large Straight | Possible score: %d", scoring[11][2]);
     if(scoring[12][1] != 1)
-        printf("\n12. Yahtzee        | Possible score: ");
+        printf("\n12. Yahtzee        | Possible score: %d", scoring[12][2]);
     if(scoring[13][1] != 1)
-        printf("\n13. Chance         | Possible score: ");
+        printf("\n13. Chance         | Possible score: %d", scoring[13][2]);
 
     return 0;
 }
