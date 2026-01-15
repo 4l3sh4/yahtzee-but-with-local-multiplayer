@@ -8,8 +8,9 @@
 #include <stdlib.h> // for randomized functions
 #include <time.h> // for the time() function
 
-// play state (running or ended)
-bool play_state = true;
+// current amount of turns
+// game ends at turn 13
+int turn_count = 1;
 
 // initializing the 'dice' array for all the players
 int p_dice[5] = { 0, 0, 0, 0, 0 };
@@ -27,7 +28,7 @@ int p_reroll[6] = { 0, 0, 0, 0, 0 };
 // player's score
 int p_score = 0;
 
-// score, if it's checked or not
+// score, if it's checked or not, possible score
 int scoring[15][3] = {
   // upper section
   {0, 0, 0}, // aces, #0 (count and add only aces)
@@ -60,197 +61,320 @@ char yes_no;
 // amount of dice to reroll
 int reroll_amount;
 
+// where the player wants to score
+int score_where;
+
 // for small straight and full straight, counting the number that are in sequential order
 int counter;
+
+// when an additional yahtzee is scored and an upper limit box is available
+// and matches the yahtzee's dices, they MUST score it there
+int required_upper_section;
+
+// if player has already scored a yahtzee
+char yahtzee_achieved = 'N';
+
+// if player has already scored a bonus
+char bonus_achieved = 'N';
+
+// calculate upper section for bonus purposes
+int calc_upper;
 
 int main() {
     srand(time(NULL));
 
-    printf("Rolling dice...\n");
+    while(turn_count < 14){
+        printf("\n\nRolling dice...\n");
 
-    for (int i = 0; i <= 4; i++) {
-        rand_num = rand() % 6 + 1;
-        p_dice[i] = rand_num;
-    }
+        for (int i = 0; i <= 4; i++) {
+            rand_num = rand() % 6 + 1;
+            p_dice[i] = rand_num;
+        }
 
-    for (int i = 0; i <= 4; i++) {
-        printf("[%d] ",p_dice[i]);
-    }
+        for (int i = 0; i <= 4; i++) {
+            printf("[%d] ",p_dice[i]);
+        }
 
-    while (add_reroll > 0){
-        printf("\n\nWould you like to re-roll any of the dices? (Y/N)\n");
-        scanf(" %c", &yes_no);
+        while (add_reroll > 0){
+            printf("\n\nWould you like to re-roll any of the dices? (Y/N)\n");
+            scanf(" %c", &yes_no);
+            while (yes_no != 'Y' && yes_no != 'N'){
+                printf("\nInvalid input!");
+                printf("\nWould you like to re-roll any of the dices? (Y/N)\n");
+                scanf(" %c", &yes_no);
+            }
 
-        if (yes_no == 'Y'){
-            add_reroll -= 1;
-            printf("\nHow many dice would you like to reroll? (0-6)\n");
-            scanf("%d", &reroll_amount);
-            if(reroll_amount > 0 && reroll_amount <= 5){
-                if(reroll_amount > 0 && reroll_amount <= 4){
-                    printf("\nPlease input which dice you would like to reroll, from left to right, with spaces.\n");
+            if (yes_no == 'Y'){
+                add_reroll -= 1;
+                printf("\nHow many dice would you like to reroll? (0-5)\n");
+                scanf("%d", &reroll_amount);
+                while(reroll_amount <= 0 || reroll_amount > 5){
+                    printf("\nInvalid input!");
+                    printf("\nHow many dice would you like to reroll? (0-5)\n");
+                    scanf("%d", &reroll_amount);
                 }
-                switch (reroll_amount) {
-                    case 1:
-                        scanf("%d", &p_reroll[0]);
-                        break;
-                    case 2:
-                        scanf("%d %d", &p_reroll[0], &p_reroll[1]);
-                        break;
-                    case 3:
-                        scanf("%d %d %d", &p_reroll[0], &p_reroll[1], &p_reroll[2]);
-                        break;
-                    case 4:
-                        scanf("%d %d %d %d", &p_reroll[0], &p_reroll[1], &p_reroll[2], &p_reroll[3]);
-                        break;
-                    case 5:
-                        for (int i = 0; i <= 4; i++) {
-                            p_reroll[i] = i + 1;
+                if(reroll_amount > 0 && reroll_amount <= 5){
+                    if(reroll_amount > 0 && reroll_amount <= 4){
+                        printf("\nPlease input which dice you would like to reroll, from left to right, with spaces.\n");
+                    }
+                    switch (reroll_amount) {
+                        case 0:
+                            break;
+                        case 1:
+                            scanf("%d", &p_reroll[0]);
+                            break;
+                        case 2:
+                            scanf("%d %d", &p_reroll[0], &p_reroll[1]);
+                            break;
+                        case 3:
+                            scanf("%d %d %d", &p_reroll[0], &p_reroll[1], &p_reroll[2]);
+                            break;
+                        case 4:
+                            scanf("%d %d %d %d", &p_reroll[0], &p_reroll[1], &p_reroll[2], &p_reroll[3]);
+                            break;
+                        case 5:
+                            for (int i = 0; i <= 4; i++) {
+                                p_reroll[i] = i + 1;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+
+                    for (int i = 0; i <= 4; i++) {
+                        if(p_reroll[i] != 0){
+                            rand_num = rand() % 6 + 1;
+                            p_dice[p_reroll[i] - 1] = rand_num;
+                            p_reroll[i] = 0;
                         }
-                        break;
-                    default:
-                        break;
-                }
+                    }
 
-                for (int i = 0; i <= 4; i++) {
-                    if(p_reroll[i] != 0){
-                        rand_num = rand() % 6 + 1;
-                        p_dice[p_reroll[i] - 1] = rand_num;
-                        p_reroll[i] = 0;
+                    printf("\nRerolling dice...\n");
+                    for (int i = 0; i <= 4; i++) {
+                        printf("[%d] ",p_dice[i]);
                     }
                 }
-
-                printf("\nRerolling dice...\n");
-                for (int i = 0; i <= 4; i++) {
-                    printf("[%d] ",p_dice[i]);
-                }
+            }
+            else if (yes_no == 'N'){
+                break;
             }
         }
-        else if (yes_no == 'N'){
-            break;
-        }
-    }
 
-    // sort the dice array, ascending
-    qsort(p_dice, n, sizeof(p_dice[0]), comp);
+        // sort the dice array, ascending
+        qsort(p_dice, n, sizeof(p_dice[0]), comp);
 
-    // calculating dice scores
-    // upper section
-    for (int i = 0; i <= 4; i++) {
-        // aces
-        if(p_dice[i] == 1){
-            scoring[0][2] += 1;
-        }
-        // twos
-        if(p_dice[i] == 2){
-            scoring[1][2] += 2;
-        }
-        // threes
-        if(p_dice[i] == 3){
-            scoring[2][2] += 3;
-        }
-        // fours
-        if(p_dice[i] == 4){
-            scoring[3][2] += 4;
-        }
-        // fives
-        if(p_dice[i] == 5){
-            scoring[4][2] += 5;
-        }
-        // sixes
-        if(p_dice[i] == 6){
-            scoring[5][2] += 6;
-        }
-    }
-
-    // lower section
-    // three-of-a-kind
-    if((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) || (p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3]) || (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4])){
+        // calculating dice scores
+        // upper section
         for (int i = 0; i <= 4; i++) {
-            scoring[7][2] += p_dice[i];
+            // aces
+            if(p_dice[i] == 1){
+                scoring[0][2] += 1;
+            }
+            // twos
+            if(p_dice[i] == 2){
+                scoring[1][2] += 2;
+            }
+            // threes
+            if(p_dice[i] == 3){
+                scoring[2][2] += 3;
+            }
+            // fours
+            if(p_dice[i] == 4){
+                scoring[3][2] += 4;
+            }
+            // fives
+            if(p_dice[i] == 5){
+                scoring[4][2] += 5;
+            }
+            // sixes
+            if(p_dice[i] == 6){
+                scoring[5][2] += 6;
+            }
         }
-    }
 
-    // four-of-a-kind
-    if((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3]) || (p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4])){
+        // lower section
+        // three-of-a-kind
+        if((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) || (p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3]) || (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4])){
+            for (int i = 0; i <= 4; i++) {
+                scoring[7][2] += p_dice[i];
+            }
+        }
+
+        // four-of-a-kind
+        if((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3]) || (p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4])){
+            for (int i = 0; i <= 4; i++) {
+                scoring[8][2] += p_dice[i];
+            }
+        }
+
+        // full house
+        if(((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) && p_dice[3] == p_dice[4]) || (p_dice[0] == p_dice[1] && (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4]))){
+            scoring[9][2] = 25;
+        }
+
+        // small straight (1-2-3-4, 2-3-4-5, 3-4-5-6)
+        counter = 0;
+        for (int i = 0; i <= 3; i++) {
+            if(p_dice[i] == p_dice[i + 1] - 1){
+                counter += 1;
+            }
+        }
+        if(counter >= 3){
+            scoring[10][2] = 30;
+        }
+
+        // full straight (1-2-3-4-5, 2-3-4-5-6)
+        counter = 0;
+        for (int i = 0; i <= 3; i++) {
+            if(p_dice[i] == p_dice[i + 1] - 1){
+                counter += 1;
+            }
+        }
+        if(counter == 4){
+            scoring[11][2] = 40;
+        }
+
+        // yahtzee
+        counter = 0;
+        for (int i = 0; i <= 3; i++) {
+            if(p_dice[i] == p_dice[i + 1]){
+                counter += 1;
+            }
+        }
+        if(counter == 4){
+            scoring[12][2] = 50;
+            required_upper_section = p_dice[0];
+        }
+
+        // chance
         for (int i = 0; i <= 4; i++) {
-            scoring[8][2] += p_dice[i];
+            scoring[13][2] += p_dice[i];
         }
-    }
 
-    // full house
-    if(((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) && p_dice[3] == p_dice[4]) || (p_dice[0] == p_dice[1] && (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4]))){
-        for (int i = 0; i <= 4; i++) {
-            scoring[9][2] += p_dice[i];
+        printf("\n\nUpper Section");
+        if(scoring[0][1] != 1)
+            printf("\n1. Aces            | Possible score: %d", scoring[0][2]);
+        if(scoring[1][1] != 1)
+            printf("\n2. Twos            | Possible score: %d", scoring[1][2]);
+        if(scoring[2][1] != 1)
+            printf("\n3. Threes          | Possible score: %d", scoring[2][2]);
+        if(scoring[3][1] != 1)
+            printf("\n4. Fours           | Possible score: %d", scoring[3][2]);
+        if(scoring[4][1] != 1)
+            printf("\n5. Fives           | Possible score: %d", scoring[4][2]);
+        if(scoring[5][1] != 1)
+            printf("\n6. Sixes           | Possible score: %d", scoring[5][2]);
+        printf("\nLower Section");
+        if(scoring[7][1] != 1)
+            printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[7][2]);
+        if(scoring[8][1] != 1)
+            printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[8][2]);
+        if(scoring[9][1] != 1)
+            printf("\n9. Full House      | Possible score: %d", scoring[9][2]);
+        if(scoring[10][1] != 1)
+            printf("\n10. Small Straight | Possible score: %d", scoring[10][2]);
+        if(scoring[11][1] != 1)
+            printf("\n11. Large Straight | Possible score: %d", scoring[11][2]);
+        if(scoring[12][1] != 1)
+            printf("\n12. Yahtzee        | Possible score: %d", scoring[12][2]);
+        if(scoring[13][1] != 1)
+            printf("\n13. Chance         | Possible score: %d", scoring[13][2]);
+        
+        // if player scores yahtzee
+        if((scoring[12][2] == 50) && (scoring[12][1] != 1)){
+            printf("\n\nCongratulations! You scored a Yahtzee!");
         }
-    }
 
-    // small straight (1-2-3-4, 2-3-4-5, 3-4-5-6)
-    counter = 0;
-    for (int i = 0; i <= 4; i++) {
-        if(p_dice[i] == p_dice[i + 1] - 1){
-            counter += 1;
+        // if player scores an additional yahtzee
+        if((scoring[12][2] == 50) && (scoring[12][1] == 1)){
+            printf("\n\nCongratulations! You scored another Yahtzee!");
         }
-    }
-    if(counter >= 4){
-        scoring[10][2] += 30;
-    }
 
-    // full straight (1-2-3-4-5, 2-3-4-5-6)
-    counter = 0;
-    for (int i = 0; i <= 4; i++) {
-        if(p_dice[i] == p_dice[i + 1] - 1){
-            counter += 1;
+        // score selection
+        printf("\n\nPlease select where you'd like to score... (1-13)\n");
+        scanf("%d", &score_where);
+        while((score_where <= 0) || (score_where >= 14) || (scoring[score_where][1] == 1)){
+            printf("\nInvalid input!");
+            printf("\nPlease select where you'd like to score... (1-13)\n");
+            scanf("%d", &score_where);
         }
-    }
-    if(counter == 5){
-        scoring[11][2] += 30;
-    }
 
-    // yahtzee
-    counter = 0;
-    for (int i = 0; i <= 4; i++) {
-        if(p_dice[i] == p_dice[i + 1]){
-            counter += 1;
+        scoring[score_where][0] = scoring[score_where][2];
+        scoring[score_where][1] = 1;
+        for (int i = 0; i <= 13; i++) {
+            scoring[i][2] == 0;
         }
-    }
-    if(counter == 5){
-        scoring[12][2] += 50;
-    }
 
-    // chance
-    for (int i = 0; i <= 4; i++) {
-        scoring[13][2] += p_dice[i];
-    }
+        // current scores
+        printf("\nCurrent Score:");
+        printf("\nUpper Section");
 
-    printf("\nPlease select where you'd like to score...");
-    printf("\nUpper Section");
-    if(scoring[0][1] != 1)
-        printf("\n1. Aces            | Possible score: %d", scoring[0][2]);
-    if(scoring[1][1] != 1)
-        printf("\n2. Twos            | Possible score: %d", scoring[1][2]);
-    if(scoring[2][1] != 1)
-        printf("\n3. Threes          | Possible score: %d", scoring[2][2]);
-    if(scoring[3][1] != 1)
-        printf("\n4. Fours           | Possible score: %d", scoring[3][2]);
-    if(scoring[4][1] != 1)
-        printf("\n5. Fives           | Possible score: %d", scoring[4][2]);
-    if(scoring[5][1] != 1)
-        printf("\n6. Sixes           | Possible score: %d", scoring[5][2]);
-    printf("\nLower Section");
-    if(scoring[7][1] != 1)
-        printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[7][2]);
-    if(scoring[8][1] != 1)
-        printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[8][2]);
-    if(scoring[9][1] != 1)
-        printf("\n9. Full House      | Possible score: %d", scoring[9][2]);
-    if(scoring[10][1] != 1)
-        printf("\n10. Small Straight | Possible score: %d", scoring[10][2]);
-    if(scoring[11][1] != 1)
-        printf("\n11. Large Straight | Possible score: %d", scoring[11][2]);
-    if(scoring[12][1] != 1)
-        printf("\n12. Yahtzee        | Possible score: %d", scoring[12][2]);
-    if(scoring[13][1] != 1)
-        printf("\n13. Chance         | Possible score: %d", scoring[13][2]);
+        printf("\n1. Aces            | %d", scoring[0][0]);
+        if (scoring[0][1] != 1) printf(" (Unscored)");
+        else if (scoring[0][1] == 1) printf(" (Scored)");
+
+        printf("\n2. Twos            | %d", scoring[1][0]);
+        if (scoring[1][1] != 1) printf(" (Unscored)");
+        else if (scoring[1][1] == 1) printf(" (Scored)");
+
+        printf("\n3. Threes          | %d", scoring[2][0]);
+        if (scoring[2][1] != 1) printf(" (Unscored)");
+        else if (scoring[2][1] == 1) printf(" (Scored)");
+
+        printf("\n4. Fours           | %d", scoring[3][0]);
+        if (scoring[3][1] != 1) printf(" (Unscored)");
+        else if (scoring[3][1] == 1) printf(" (Scored)");
+
+        printf("\n5. Fives           | %d", scoring[4][0]);
+        if (scoring[4][1] != 1) printf(" (Unscored)");
+        else if (scoring[4][1] == 1) printf(" (Scored)");
+
+        printf("\n6. Sixes           | %d", scoring[5][0]);
+        if (scoring[5][1] != 1) printf(" (Unscored)");
+        else if (scoring[5][1] == 1) printf(" (Scored)");
+
+        printf("\nLower Section");
+
+        printf("\n7. Three-of-a-Kind | %d", scoring[7][0]);
+        if (scoring[7][1] != 1) printf(" (Unscored)");
+        else if (scoring[7][1] == 1) printf(" (Scored)");
+
+        printf("\n8. Four-of-a-Kind  | %d", scoring[8][0]);
+        if (scoring[8][1] != 1) printf(" (Unscored)");
+        else if (scoring[8][1] == 1) printf(" (Scored)");
+
+        printf("\n9. Full House      | %d", scoring[9][0]);
+        if (scoring[9][1] != 1) printf(" (Unscored)");
+        else if (scoring[9][1] == 1) printf(" (Scored)");
+
+        printf("\n10. Small Straight | %d", scoring[10][0]);
+        if (scoring[10][1] != 1) printf(" (Unscored)");
+        else if (scoring[10][1] == 1) printf(" (Scored)");
+
+        printf("\n11. Large Straight | %d", scoring[11][0]);
+        if (scoring[11][1] != 1) printf(" (Unscored)");
+        else if (scoring[11][1] == 1) printf(" (Scored)");
+
+        printf("\n12. Yahtzee        | %d", scoring[12][0]);
+        if (scoring[12][1] != 1) printf(" (Unscored)");
+        else if (scoring[12][1] == 1) printf(" (Scored)");
+
+        printf("\n13. Chance         | %d", scoring[13][0]);
+        if (scoring[13][1] != 1) printf(" (Unscored)");
+        else if (scoring[13][1] == 1) printf(" (Scored)");
+
+        if(bonus_achieved == 'N'){
+            for (int i = 0; i <= 5; i++) {
+                calc_upper += scoring[i][0];
+            }
+            if(calc_upper < 63){
+                
+            }
+        }
+
+        turn_count += 1;
+        add_reroll = 2;
+    }
 
     return 0;
 }
