@@ -46,7 +46,7 @@ int scoring[15][3] = {
   {0, 0, 0}, // large straight, #11 (40 points for any five sequential dice)
   {0, 0, 0}, // yahtzee, #12 (50 points for all five dice being the same)
   {0, 0, 0}, // chance, #13 (sum of all 5 dice)
-  {0, 0, 0} // yahtzee bonus, #14
+  {0, 0, 0} // yahtzee bonus, #14 (100 bonus points)
 };
 
 // amount of times a player can reroll
@@ -71,14 +71,24 @@ int counter;
 // and matches the yahtzee's dices, they MUST score it there
 int required_upper_section;
 
-// if player has already scored a yahtzee
+// if player has scored a yahtzee for the first time and filled in the box
 char yahtzee_achieved = 'N';
+
+// if player has already scored a yahtzee
+char add_yahtzee_achieved = 'N';
 
 // if player has already scored a bonus
 char bonus_achieved = 'N';
 
 // calculate upper section for bonus purposes
 int calc_upper;
+
+// amount of points left in the upper section to achieve a 35-point bonus
+int points_to_bonus;
+
+// is any of the two sections are filled or not
+char upper_section_filled = 'N';
+char lower_section_filled = 'N';
 
 int main() {
     srand(time(NULL));
@@ -243,7 +253,7 @@ int main() {
         }
         if(counter == 4){
             scoring[12][2] = 50;
-            required_upper_section = p_dice[0];
+            required_upper_section = p_dice[0] - 1;
         }
 
         // chance
@@ -288,21 +298,28 @@ int main() {
         // if player scores an additional yahtzee
         if((scoring[12][2] == 50) && (scoring[12][1] == 1)){
             printf("\n\nCongratulations! You scored another Yahtzee!");
+            if(scoring[required_upper_section][1] == 0){
+                scoring[required_upper_section][0] = scoring[required_upper_section][2];
+                printf("\nSince you have scored another Yahtzee and UPPER SECTION #%d is available, that section has been automatically filled with %d points.", required_upper_section + 1, scoring[required_upper_section][0]);
+            }
+            else if (scoring[required_upper_section][1] != 0 && lower_section_filled == 'N'){
+
+            }
         }
 
         // score selection
         printf("\n\nPlease select where you'd like to score... (1-13)\n");
-        scanf("%d", &score_where);
+        scanf(" %d", &score_where);
         while((score_where <= 0) || (score_where >= 14) || (scoring[score_where][1] == 1)){
             printf("\nInvalid input!");
             printf("\nPlease select where you'd like to score... (1-13)\n");
-            scanf("%d", &score_where);
+            scanf(" %d", &score_where);
         }
 
-        scoring[score_where][0] = scoring[score_where][2];
-        scoring[score_where][1] = 1;
+        scoring[score_where - 1][0] = scoring[score_where][2];
+        scoring[score_where - 1][1] = 1;
         for (int i = 0; i <= 13; i++) {
-            scoring[i][2] == 0;
+            scoring[i][2] = 0;
         }
 
         // current scores
@@ -368,7 +385,34 @@ int main() {
                 calc_upper += scoring[i][0];
             }
             if(calc_upper < 63){
-                
+                points_to_bonus = 63 - calc_upper;
+                printf("\n\nYou need get %d more points in the UPPER SECTION to receive a 35-point bonus!", points_to_bonus);
+            }
+            else {
+                printf("\n\nCongratulations! You've achieved 63 or more points in the UPPER SECTION and received a 35-point bonus!");
+                bonus_achieved = 'Y';
+            }
+        }
+
+        counter = 0;
+        if(upper_section_filled = 'N'){
+            for (int i = 0; i <= 5; i++) {
+                counter += 1;
+            }
+            if(counter == 6){
+                upper_section_filled = 'Y';
+                printf("\n\nThe UPPER SECTION has been completely filled!");
+            }
+        }
+
+        counter = 0;
+        if(lower_section_filled = 'N'){
+            for (int i = 7; i <= 13; i++) {
+                counter += 1;
+            }
+            if(counter == 7){
+                lower_section_filled = 'Y';
+                printf("\n\nThe LOWER SECTION has been completely filled!");
             }
         }
 
