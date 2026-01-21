@@ -100,6 +100,14 @@ char lower_section_filled = 'N';
 int upper_total_score;
 int lower_total_score;
 
+void clear_input_buffer(void) {
+    int c;
+    // Read and discard characters until a newline or end-of-file is found
+    while ((c = getchar()) != '\n' && c != EOF) {
+        ; // Empty statement intentional
+    }
+}
+
 int main() {
     srand(time(NULL));
 
@@ -116,24 +124,27 @@ int main() {
         for (int i = 0; i <= 4; i++) {
             printf("[%d] ",p_dice[i]);
         }
+        printf("\n");
 
         while (add_reroll > 0){
-            printf("\n\nWould you like to re-roll any of the dices? (Y/N)\n");
+            printf("\nWould you like to re-roll any of the dices? (Y/N)\n");
             scanf(" %c", &yes_no);
             while (yes_no != 'Y' && yes_no != 'N'){
                 printf("\nInvalid input!");
                 printf("\nWould you like to re-roll any of the dices? (Y/N)\n");
+                clear_input_buffer();
                 scanf(" %c", &yes_no);
             }
 
             if (yes_no == 'Y'){
                 add_reroll -= 1;
-                printf("\nHow many dice would you like to reroll? (0-5)\n");
-                scanf("%d", &reroll_amount);
+                printf("\nHow many dice would you like to reroll? (1-5)\n");
+                scanf(" %d", &reroll_amount);
                 while(reroll_amount <= 0 || reroll_amount > 5){
                     printf("\nInvalid input!");
-                    printf("\nHow many dice would you like to reroll? (0-5)\n");
-                    scanf("%d", &reroll_amount);
+                    printf("\nHow many dice would you like to reroll? (1-5)\n");
+                    clear_input_buffer();
+                    scanf(" %d", &reroll_amount);
                 }
                 if(reroll_amount > 0 && reroll_amount <= 5){
                     if(reroll_amount > 0 && reroll_amount <= 4){
@@ -144,15 +155,19 @@ int main() {
                             break;
                         case 1:
                             scanf("%d", &p_reroll[0]);
+                            clear_input_buffer();
                             break;
                         case 2:
                             scanf("%d %d", &p_reroll[0], &p_reroll[1]);
+                            clear_input_buffer();
                             break;
                         case 3:
                             scanf("%d %d %d", &p_reroll[0], &p_reroll[1], &p_reroll[2]);
+                            clear_input_buffer();
                             break;
                         case 4:
                             scanf("%d %d %d %d", &p_reroll[0], &p_reroll[1], &p_reroll[2], &p_reroll[3]);
+                            clear_input_buffer();
                             break;
                         case 5:
                             for (int i = 0; i <= 4; i++) {
@@ -175,6 +190,7 @@ int main() {
                     for (int i = 0; i <= 4; i++) {
                         printf("[%d] ",p_dice[i]);
                     }
+                    printf("\n");
                 }
             }
             else if (yes_no == 'N'){
@@ -185,7 +201,7 @@ int main() {
         // sort the dice array, ascending
         qsort(p_dice, n, sizeof(p_dice[0]), comp);
 
-        for (int i = 0; i <= 4; i++) {
+        for (int i = 0; i <= 5; i++) {
             p_dice[i] = 6;
         }
 
@@ -285,7 +301,7 @@ int main() {
         }
 
         if(upper_section_filled == 'N'){
-            printf("\n\nUpper Section");
+            printf("\nUpper Section");
             if(scoring[0][1] != 1)
                 printf("\n1. Aces            | Possible score: %d", scoring[0][2]);
             if(scoring[1][1] != 1)
@@ -357,6 +373,7 @@ int main() {
                 while((score_where <= 0) || (score_where >= 14) || (scoring[score_where - 1][1] == 1)){
                     printf("\nInvalid input!");
                     printf("\nPlease select where you'd like to score... (1-13)\n");
+                    clear_input_buffer();
                     scanf(" %d", &score_where);
                 }
             }
@@ -366,6 +383,7 @@ int main() {
                 while((score_where <= 5) || (score_where >= 14) || (scoring[score_where - 1][1] == 1)){
                     printf("\nInvalid input!");
                     printf("\nPlease select where you'd like to score... (6-13)\n");
+                    clear_input_buffer();
                     scanf(" %d", &score_where);
                 }
             }
