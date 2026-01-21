@@ -37,15 +37,15 @@ int scoring[15][3] = {
   {0, 0, 0}, // fours, #3 (count and add only fours)
   {0, 0, 0}, // fives, #4 (count and add only fives)
   {0, 0, 0}, // sixes, #5 (count and add only sixes)
-  {0, 0, 0}, // bonus, #6 (if total of all upper section boxes is >= 63, add a 35-point bonus)
+  {0, 0, 0}, // three-of-a-kind, #6 (sum of all 5 dice if at least 3 dice match)
+  {0, 0, 0}, // four-of-a-kind, #7 (sum of all 5 dice if at least 4 dice match)
+  {0, 0, 0}, // full house, #8 (25 points for any set of 3 matching dice + a pair of matching dice)
+  {0, 0, 0}, // small straight, #9 (30 points for any four sequential dice)
+  {0, 0, 0}, // large straight, #10 (40 points for any five sequential dice)
+  {0, 0, 0}, // yahtzee, #11 (50 points for all five dice being the same)
+  {0, 0, 0}, // chance, #12 (sum of all 5 dice)
+  {0, 0, 0}, // bonus, #13 (if total of all upper section boxes is >= 63, add a 35-point bonus)
   // lower section
-  {0, 0, 0}, // three-of-a-kind, #7 (sum of all 5 dice if at least 3 dice match)
-  {0, 0, 0}, // four-of-a-kind, #8 (sum of all 5 dice if at least 4 dice match)
-  {0, 0, 0}, // full house, #9 (25 points for any set of 3 matching dice + a pair of matching dice)
-  {0, 0, 0}, // small straight, #10 (30 points for any four sequential dice)
-  {0, 0, 0}, // large straight, #11 (40 points for any five sequential dice)
-  {0, 0, 0}, // yahtzee, #12 (50 points for all five dice being the same)
-  {0, 0, 0}, // chance, #13 (sum of all 5 dice)
   {0, 0, 0} // yahtzee bonus, #14 (100 bonus points)
 };
 
@@ -206,20 +206,20 @@ int main() {
         // three-of-a-kind
         if((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) || (p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3]) || (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4])){
             for (int i = 0; i <= 4; i++) {
-                scoring[7][2] += p_dice[i];
+                scoring[6][2] += p_dice[i];
             }
         }
 
         // four-of-a-kind
         if((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3]) || (p_dice[1] == p_dice[2] && p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4])){
             for (int i = 0; i <= 4; i++) {
-                scoring[8][2] += p_dice[i];
+                scoring[7][2] += p_dice[i];
             }
         }
 
         // full house
         if(((p_dice[0] == p_dice[1] && p_dice[1] == p_dice[2]) && p_dice[3] == p_dice[4]) || (p_dice[0] == p_dice[1] && (p_dice[2] == p_dice[3] && p_dice[3] == p_dice[4]))){
-            scoring[9][2] = 25;
+            scoring[8][2] = 25;
         }
 
         // small straight (1-2-3-4, 2-3-4-5, 3-4-5-6)
@@ -230,7 +230,7 @@ int main() {
             }
         }
         if(counter >= 3){
-            scoring[10][2] = 30;
+            scoring[9][2] = 30;
         }
 
         // full straight (1-2-3-4-5, 2-3-4-5-6)
@@ -241,7 +241,7 @@ int main() {
             }
         }
         if(counter == 4){
-            scoring[11][2] = 40;
+            scoring[10][2] = 40;
         }
 
         // yahtzee
@@ -252,13 +252,13 @@ int main() {
             }
         }
         if(counter == 4){
-            scoring[12][2] = 50;
+            scoring[11][2] = 50;
             required_upper_section = p_dice[0] - 1;
         }
 
         // chance
         for (int i = 0; i <= 4; i++) {
-            scoring[13][2] += p_dice[i];
+            scoring[12][2] += p_dice[i];
         }
 
         printf("\n\nUpper Section");
@@ -275,28 +275,28 @@ int main() {
         if(scoring[5][1] != 1)
             printf("\n6. Sixes           | Possible score: %d", scoring[5][2]);
         printf("\nLower Section");
+        if(scoring[6][1] != 1)
+            printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[6][2]);
         if(scoring[7][1] != 1)
-            printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[7][2]);
+            printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[7][2]);
         if(scoring[8][1] != 1)
-            printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[8][2]);
+            printf("\n9. Full House      | Possible score: %d", scoring[8][2]);
         if(scoring[9][1] != 1)
-            printf("\n9. Full House      | Possible score: %d", scoring[9][2]);
+            printf("\n10. Small Straight | Possible score: %d", scoring[9][2]);
         if(scoring[10][1] != 1)
-            printf("\n10. Small Straight | Possible score: %d", scoring[10][2]);
+            printf("\n11. Large Straight | Possible score: %d", scoring[10][2]);
         if(scoring[11][1] != 1)
-            printf("\n11. Large Straight | Possible score: %d", scoring[11][2]);
+            printf("\n12. Yahtzee        | Possible score: %d", scoring[11][2]);
         if(scoring[12][1] != 1)
-            printf("\n12. Yahtzee        | Possible score: %d", scoring[12][2]);
-        if(scoring[13][1] != 1)
-            printf("\n13. Chance         | Possible score: %d", scoring[13][2]);
+            printf("\n13. Chance         | Possible score: %d", scoring[12][2]);
         
         // if player scores yahtzee
-        if((scoring[12][2] == 50) && (scoring[12][1] != 1)){
+        if((scoring[11][2] == 50) && (scoring[11][1] != 1)){
             printf("\n\nCongratulations! You scored a Yahtzee!");
         }
 
         // if player scores an additional yahtzee
-        if((scoring[12][2] == 50) && (scoring[12][1] == 1)){
+        if((scoring[11][2] == 50) && (scoring[11][1] == 1)){
             printf("\n\nCongratulations! You scored another Yahtzee!");
             if(scoring[required_upper_section][1] == 0){
                 scoring[required_upper_section][0] = scoring[required_upper_section][2];
@@ -310,18 +310,18 @@ int main() {
         // score selection
         printf("\n\nPlease select where you'd like to score... (1-13)\n");
         scanf(" %d", &score_where);
-        while((score_where <= 0) || (score_where >= 14) || (scoring[score_where][1] == 1)){
+        while((score_where <= 0) || (score_where >= 14) || (scoring[score_where - 1][1] == 1)){
             printf("\nInvalid input!");
             printf("\nPlease select where you'd like to score... (1-13)\n");
             scanf(" %d", &score_where);
         }
 
-        scoring[score_where - 1][0] = scoring[score_where][2];
+        scoring[score_where - 1][0] = scoring[score_where - 1][2];
         scoring[score_where - 1][1] = 1;
-        for (int i = 0; i <= 13; i++) {
+        for (int i = 0; i <= 12; i++) {
             scoring[i][2] = 0;
         }
-
+        
         // current scores
         printf("\nCurrent Score:");
         printf("\nUpper Section");
@@ -352,33 +352,33 @@ int main() {
 
         printf("\nLower Section");
 
-        printf("\n7. Three-of-a-Kind | %d", scoring[7][0]);
+        printf("\n7. Three-of-a-Kind | %d", scoring[6][0]);
+        if (scoring[6][1] != 1) printf(" (Unscored)");
+        else if (scoring[6][1] == 1) printf(" (Scored)");
+
+        printf("\n8. Four-of-a-Kind  | %d", scoring[7][0]);
         if (scoring[7][1] != 1) printf(" (Unscored)");
         else if (scoring[7][1] == 1) printf(" (Scored)");
 
-        printf("\n8. Four-of-a-Kind  | %d", scoring[8][0]);
+        printf("\n9. Full House      | %d", scoring[8][0]);
         if (scoring[8][1] != 1) printf(" (Unscored)");
         else if (scoring[8][1] == 1) printf(" (Scored)");
 
-        printf("\n9. Full House      | %d", scoring[9][0]);
+        printf("\n10. Small Straight | %d", scoring[9][0]);
         if (scoring[9][1] != 1) printf(" (Unscored)");
         else if (scoring[9][1] == 1) printf(" (Scored)");
 
-        printf("\n10. Small Straight | %d", scoring[10][0]);
+        printf("\n11. Large Straight | %d", scoring[10][0]);
         if (scoring[10][1] != 1) printf(" (Unscored)");
         else if (scoring[10][1] == 1) printf(" (Scored)");
 
-        printf("\n11. Large Straight | %d", scoring[11][0]);
+        printf("\n12. Yahtzee        | %d", scoring[11][0]);
         if (scoring[11][1] != 1) printf(" (Unscored)");
         else if (scoring[11][1] == 1) printf(" (Scored)");
 
-        printf("\n12. Yahtzee        | %d", scoring[12][0]);
+        printf("\n13. Chance         | %d", scoring[12][0]);
         if (scoring[12][1] != 1) printf(" (Unscored)");
         else if (scoring[12][1] == 1) printf(" (Scored)");
-
-        printf("\n13. Chance         | %d", scoring[13][0]);
-        if (scoring[13][1] != 1) printf(" (Unscored)");
-        else if (scoring[13][1] == 1) printf(" (Scored)");
 
         if(bonus_achieved == 'N'){
             for (int i = 0; i <= 5; i++) {
@@ -387,9 +387,11 @@ int main() {
             if(calc_upper < 63){
                 points_to_bonus = 63 - calc_upper;
                 printf("\n\nYou need get %d more points in the UPPER SECTION to receive a 35-point bonus!", points_to_bonus);
+                calc_upper = 0;
             }
             else {
                 printf("\n\nCongratulations! You've achieved 63 or more points in the UPPER SECTION and received a 35-point bonus!");
+                scoring[13][1] = 35;
                 bonus_achieved = 'Y';
             }
         }
@@ -397,7 +399,7 @@ int main() {
         counter = 0;
         if(upper_section_filled = 'N'){
             for (int i = 0; i <= 5; i++) {
-                counter += 1;
+                if(scoring[i][1] == 1) counter += 1;
             }
             if(counter == 6){
                 upper_section_filled = 'Y';
@@ -407,8 +409,8 @@ int main() {
 
         counter = 0;
         if(lower_section_filled = 'N'){
-            for (int i = 7; i <= 13; i++) {
-                counter += 1;
+            for (int i = 6; i <= 12; i++) {
+                if(scoring[i][1] == 1) counter += 1;
             }
             if(counter == 7){
                 lower_section_filled = 'Y';
