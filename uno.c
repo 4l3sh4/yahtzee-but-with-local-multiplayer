@@ -74,8 +74,14 @@ int required_upper_section;
 // if player has scored a yahtzee for the first time and filled in the box
 char yahtzee_achieved = 'N';
 
-// if player has already scored a yahtzee
-char add_yahtzee_achieved = 'N';
+// amount of yahtzees
+int amount_yahtzee;
+
+// when the player can only score the lower sections after the upper section has been fileld (Joker rules)
+char lower_section_only = 'N';
+
+// skip the scoring phase (applies when the player is forced to score the upper section after scoring an additional yahtzee)
+char skip_scoring = 'N';
 
 // if player has already scored a bonus
 char bonus_achieved = 'N';
@@ -173,6 +179,10 @@ int main() {
         // sort the dice array, ascending
         qsort(p_dice, n, sizeof(p_dice[0]), comp);
 
+        for (int i = 0; i <= 4; i++) {
+            p_dice[i] = 6;
+        }
+
         // calculating dice scores
         // upper section
         for (int i = 0; i <= 4; i++) {
@@ -233,7 +243,7 @@ int main() {
             scoring[9][2] = 30;
         }
 
-        // full straight (1-2-3-4-5, 2-3-4-5-6)
+        // large straight (1-2-3-4-5, 2-3-4-5-6)
         counter = 0;
         for (int i = 0; i <= 3; i++) {
             if(p_dice[i] == p_dice[i + 1] - 1){
@@ -261,66 +271,106 @@ int main() {
             scoring[12][2] += p_dice[i];
         }
 
-        printf("\n\nUpper Section");
-        if(scoring[0][1] != 1)
-            printf("\n1. Aces            | Possible score: %d", scoring[0][2]);
-        if(scoring[1][1] != 1)
-            printf("\n2. Twos            | Possible score: %d", scoring[1][2]);
-        if(scoring[2][1] != 1)
-            printf("\n3. Threes          | Possible score: %d", scoring[2][2]);
-        if(scoring[3][1] != 1)
-            printf("\n4. Fours           | Possible score: %d", scoring[3][2]);
-        if(scoring[4][1] != 1)
-            printf("\n5. Fives           | Possible score: %d", scoring[4][2]);
-        if(scoring[5][1] != 1)
-            printf("\n6. Sixes           | Possible score: %d", scoring[5][2]);
-        printf("\nLower Section");
-        if(scoring[6][1] != 1)
-            printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[6][2]);
-        if(scoring[7][1] != 1)
-            printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[7][2]);
-        if(scoring[8][1] != 1)
-            printf("\n9. Full House      | Possible score: %d", scoring[8][2]);
-        if(scoring[9][1] != 1)
-            printf("\n10. Small Straight | Possible score: %d", scoring[9][2]);
-        if(scoring[10][1] != 1)
-            printf("\n11. Large Straight | Possible score: %d", scoring[10][2]);
-        if(scoring[11][1] != 1)
-            printf("\n12. Yahtzee        | Possible score: %d", scoring[11][2]);
-        if(scoring[12][1] != 1)
-            printf("\n13. Chance         | Possible score: %d", scoring[12][2]);
-        
-        // if player scores yahtzee
-        if((scoring[11][2] == 50) && (scoring[11][1] != 1)){
-            printf("\n\nCongratulations! You scored a Yahtzee!");
+        // joker rules
+        if (yahtzee_achieved == 'Y' && scoring[11][2] == 50){
+            scoring[8][2] = 25;
+            scoring[9][2] = 30;
+            scoring[10][2] = 40;
         }
 
+        if(upper_section_filled == 'N'){
+            printf("\n\nUpper Section");
+            if(scoring[0][1] != 1)
+                printf("\n1. Aces            | Possible score: %d", scoring[0][2]);
+            if(scoring[1][1] != 1)
+                printf("\n2. Twos            | Possible score: %d", scoring[1][2]);
+            if(scoring[2][1] != 1)
+                printf("\n3. Threes          | Possible score: %d", scoring[2][2]);
+            if(scoring[3][1] != 1)
+                printf("\n4. Fours           | Possible score: %d", scoring[3][2]);
+            if(scoring[4][1] != 1)
+                printf("\n5. Fives           | Possible score: %d", scoring[4][2]);
+            if(scoring[5][1] != 1)
+                printf("\n6. Sixes           | Possible score: %d", scoring[5][2]);
+        }
+        if(lower_section_filled == 'N'){
+            printf("\nLower Section");
+            if(scoring[6][1] != 1)
+                printf("\n7. Three-of-a-Kind | Possible score: %d", scoring[6][2]);
+            if(scoring[7][1] != 1)
+                printf("\n8. Four-of-a-Kind  | Possible score: %d", scoring[7][2]);
+            if(scoring[8][1] != 1)
+                printf("\n9. Full House      | Possible score: %d", scoring[8][2]);
+            if(scoring[9][1] != 1)
+                printf("\n10. Small Straight | Possible score: %d", scoring[9][2]);
+            if(scoring[10][1] != 1)
+                printf("\n11. Large Straight | Possible score: %d", scoring[10][2]);
+            if(scoring[11][1] != 1)
+                printf("\n12. Yahtzee        | Possible score: %d", scoring[11][2]);
+            if(scoring[12][1] != 1)
+                printf("\n13. Chance         | Possible score: %d", scoring[12][2]);
+        }
+        
         // if player scores an additional yahtzee
-        if((scoring[11][2] == 50) && (scoring[11][1] == 1)){
+        if((scoring[11][2] == 50) && (amount_yahtzee >= 1)){
             printf("\n\nCongratulations! You scored another Yahtzee!");
-            if(scoring[required_upper_section][1] == 0){
-                scoring[required_upper_section][0] = scoring[required_upper_section][2];
-                printf("\nSince you have scored another Yahtzee and UPPER SECTION #%d is available, that section has been automatically filled with %d points.", required_upper_section + 1, scoring[required_upper_section][0]);
+            amount_yahtzee += 1;
+            // if the player has scored a yahtzee in the yahtzee box, give them 100 bonus points
+            if(yahtzee_achieved == 'Y'){
+                scoring[14][0] += 100;
             }
-            else if (scoring[required_upper_section][1] != 0 && lower_section_filled == 'N'){
+            // checks if the yahtzee box has been filled to apply Joker rules
+            if(scoring[11][1] == 1){
+                // player must score in the upper section (if it has not been filled yet)
+                if(scoring[required_upper_section][1] == 0){
+                    scoring[required_upper_section][0] = scoring[required_upper_section][2];
+                    scoring[required_upper_section][1] = 1;
+                    printf("\nSince you have scored another Yahtzee and UPPER SECTION #%d is available, that section has been automatically filled with %d points.\n", required_upper_section + 1, scoring[required_upper_section][0]);
+                    skip_scoring = 'Y';
+                }
+                // player can score in the lower section (if the upper section box's has been already filled)
+                else if (scoring[required_upper_section][1] == 1 && lower_section_filled == 'N'){
+                    printf("\nSince you have scored another Yahtzee and but UPPER SECTION #%d is NOT available, you may use the additional Yahtzee to score any LOWER SECTIONS.", required_upper_section + 1);
+                    lower_section_only = 'Y';
+                }
+            }
+        }
 
-            }
+        // if player scores yahtzee
+        if((scoring[11][2] == 50) && (amount_yahtzee == 0)){
+            printf("\n\nCongratulations! You scored a Yahtzee!");
+            amount_yahtzee += 1;
         }
 
         // score selection
-        printf("\n\nPlease select where you'd like to score... (1-13)\n");
-        scanf(" %d", &score_where);
-        while((score_where <= 0) || (score_where >= 14) || (scoring[score_where - 1][1] == 1)){
-            printf("\nInvalid input!");
-            printf("\nPlease select where you'd like to score... (1-13)\n");
-            scanf(" %d", &score_where);
+        if(skip_scoring == 'N'){
+            if(lower_section_only == 'N'){
+                printf("\n\nPlease select where you'd like to score... (1-13)\n");
+                scanf(" %d", &score_where);
+                while((score_where <= 0) || (score_where >= 14) || (scoring[score_where - 1][1] == 1)){
+                    printf("\nInvalid input!");
+                    printf("\nPlease select where you'd like to score... (1-13)\n");
+                    scanf(" %d", &score_where);
+                }
+            }
+            else if(lower_section_only == 'Y'){
+                printf("\n\nPlease select where you'd like to score... (6-13)\n");
+                scanf(" %d", &score_where);
+                while((score_where <= 5) || (score_where >= 14) || (scoring[score_where - 1][1] == 1)){
+                    printf("\nInvalid input!");
+                    printf("\nPlease select where you'd like to score... (6-13)\n");
+                    scanf(" %d", &score_where);
+                }
+            }
+            scoring[score_where - 1][0] = scoring[score_where - 1][2];
+            scoring[score_where - 1][1] = 1;
         }
 
-        scoring[score_where - 1][0] = scoring[score_where - 1][2];
-        scoring[score_where - 1][1] = 1;
         for (int i = 0; i <= 12; i++) {
             scoring[i][2] = 0;
         }
+
+        if(scoring[11][0] == 50) yahtzee_achieved = 'Y';
         
         // current scores
         printf("\nCurrent Score:");
@@ -397,7 +447,7 @@ int main() {
         }
 
         counter = 0;
-        if(upper_section_filled = 'N'){
+        if(upper_section_filled == 'N'){
             for (int i = 0; i <= 5; i++) {
                 if(scoring[i][1] == 1) counter += 1;
             }
@@ -408,7 +458,7 @@ int main() {
         }
 
         counter = 0;
-        if(lower_section_filled = 'N'){
+        if(lower_section_filled == 'N'){
             for (int i = 6; i <= 12; i++) {
                 if(scoring[i][1] == 1) counter += 1;
             }
@@ -418,6 +468,8 @@ int main() {
             }
         }
 
+        skip_scoring = 'N';
+        lower_section_only = 'N';
         turn_count += 1;
         add_reroll = 2;
     }
