@@ -96,10 +96,16 @@ int points_to_bonus;
 char upper_section_filled = 'N';
 char lower_section_filled = 'N';
 
+// scoring stuff
+int upper_total_score;
+int lower_total_score;
+
 int main() {
     srand(time(NULL));
 
     while(turn_count < 14){
+        printf("\n\n[TURN %d]", turn_count);
+
         printf("\n\nRolling dice...\n");
 
         for (int i = 0; i <= 4; i++) {
@@ -318,6 +324,7 @@ int main() {
             // if the player has scored a yahtzee in the yahtzee box, give them 100 bonus points
             if(yahtzee_achieved == 'Y'){
                 scoring[14][0] += 100;
+                scoring[14][1] = 1;
             }
             // checks if the yahtzee box has been filled to apply Joker rules
             if(scoring[11][1] == 1){
@@ -441,7 +448,8 @@ int main() {
             }
             else {
                 printf("\n\nCongratulations! You've achieved 63 or more points in the UPPER SECTION and received a 35-point bonus!");
-                scoring[13][1] = 35;
+                scoring[13][0] = 35;
+                scoring[13][1] = 1;
                 bonus_achieved = 'Y';
             }
         }
@@ -473,6 +481,56 @@ int main() {
         turn_count += 1;
         add_reroll = 2;
     }
+
+    printf("\n\nGame had ended!");
+
+    for (int i = 0; i <= 5; i++) {
+        upper_total_score += scoring[i][0];
+    }
+
+    for (int i = 6; i <= 12; i++) {
+        lower_total_score += scoring[i][0];
+    }
+
+    for (int i = 0; i <= 14; i++) {
+        p_score += scoring[i][0];
+    }
+
+    // current scores
+    printf("\n\nFinal Score:");
+    printf("\nUpper Section");
+    printf("\n-------------------- ");
+    printf("\n1. Aces             | %d", scoring[0][0]);
+    printf("\n2. Twos             | %d", scoring[1][0]);
+    printf("\n3. Threes           | %d", scoring[2][0]);
+    printf("\n4. Fours            | %d", scoring[3][0]);
+    printf("\n5. Fives            | %d", scoring[4][0]);
+    printf("\n6. Sixes            | %d", scoring[5][0]);
+    printf("\n--------------------|");
+    printf("\nTotal Score         | %d", upper_total_score);
+    printf("\n--------------------|");
+    printf("\nBonus               | %d", scoring[13][0]);
+    printf("\n--------------------|");
+    printf("\nTotal Upper Section | %d", upper_total_score + scoring[13][0]);
+    printf("\n-------------------- \n");
+
+    printf("\nLower Section");
+    printf("\n------------------------------------- ");
+    printf("\n7. Three-of-a-Kind                   | %d", scoring[6][0]);
+    printf("\n8. Four-of-a-Kind                    | %d", scoring[7][0]);
+    printf("\n9. Full House                        | %d", scoring[8][0]);
+    printf("\n10. Small Straight                   | %d", scoring[9][0]);
+    printf("\n11. Large Straight                   | %d", scoring[10][0]);
+    printf("\n12. Yahtzee                          | %d", scoring[11][0]);
+    printf("\n13. Chance                           | %d", scoring[12][0]);
+    printf("\n-------------------------------------|");
+    printf("\nYahtzee Bonus (100 per add. Yahtzee) | %d", scoring[14][0]);
+    printf("\n-------------------------------------|");
+    printf("\nTotal Lower Section                  | %d", lower_total_score + scoring[14][0]);
+    printf("\nTotal Upper Section                  | %d", upper_total_score + scoring[13][0]);
+    printf("\n-------------------------------------|");
+    printf("\nGRAND TOTAL                          | %d", p_score);
+    printf("\n------------------------------------- \n");
 
     return 0;
 }
