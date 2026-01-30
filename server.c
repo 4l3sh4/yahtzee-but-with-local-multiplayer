@@ -30,14 +30,28 @@ typedef struct {
     int game_started;
     int game_round;
     int game_finished;
+
     char player_names[MAX_PLAYERS][NAME_SIZE];
-    int player_connected[MAX_PLAYERS];
-    int player_dice[MAX_PLAYERS][5];
-    int player_rerolls_left[MAX_PLAYERS];
-    int player_scores[MAX_PLAYERS][15][3];
+    int  player_connected[MAX_PLAYERS];
+
+    int  player_dice[MAX_PLAYERS][5];
+    int  player_rerolls_left[MAX_PLAYERS];
+
+    int  player_scores[MAX_PLAYERS][15][3];
+
+    char yahtzee_achieved[MAX_PLAYERS];        // 'Y' once Yahtzee box scored with 50
+    int  amount_yahtzee[MAX_PLAYERS];          // number of Yahtzee rolls obtained so far
+    int  required_upper_section[MAX_PLAYERS];  // 0..5 (aces..sixes) when a Yahtzee is rolled
+    char lower_section_only[MAX_PLAYERS];      // 'Y' when forced to score lower section (joker flow)
+    char skip_scoring[MAX_PLAYERS];            // 'Y' when server auto-scores required upper section
+    char bonus_achieved[MAX_PLAYERS];          // 'Y' once upper bonus awarded
+    char upper_section_filled[MAX_PLAYERS];    // 'Y' when aces..sixes all filled
+    char lower_section_filled[MAX_PLAYERS];    // 'Y' when categories 6..12 all filled
+
     pthread_mutex_t game_mutex;
     pthread_mutex_t log_mutex;
     sem_t turn_sem[MAX_PLAYERS];
+
     int total_wins[MAX_PLAYERS];
 } GameState;
 
@@ -111,13 +125,15 @@ void reroll_dice(int player_id, int dice_to_reroll[], int count) {
 
 void calculate_possible_scores(int player_id) {
     int dice[5];
+
     pthread_mutex_lock(&game_state->game_mutex);
-    
+
     for (int i = 0; i < 5; i++) dice[i] = game_state->player_dice[player_id][i];
     qsort(dice, 5, sizeof(int), compare_int);
-    
-    for (int i = 0; i < 13; i++) game_state->player_scores[player_id][i][2] = 0;
-    
+
+    // reset possible scores
+    for (int i = 0; i < 15; i++) game_state->player_scores[player_id][i][2] = 0;
+
     // Upper section
     for (int i = 0; i < 5; i++) {
         if (dice[i] == 1) game_state->player_scores[player_id][0][2] += 1;
@@ -127,59 +143,111 @@ void calculate_possible_scores(int player_id) {
         if (dice[i] == 5) game_state->player_scores[player_id][4][2] += 5;
         if (dice[i] == 6) game_state->player_scores[player_id][5][2] += 6;
     }
-    
+
     // Three of a kind
     if (has_n_of_a_kind(dice, 3)) {
         int sum = 0;
         for (int i = 0; i < 5; i++) sum += dice[i];
         game_state->player_scores[player_id][6][2] = sum;
     }
-    
+
     // Four of a kind
     if (has_n_of_a_kind(dice, 4)) {
         int sum = 0;
         for (int i = 0; i < 5; i++) sum += dice[i];
         game_state->player_scores[player_id][7][2] = sum;
     }
-    
+
+    // Full house / straights / yahtzee
     if (is_full_house(dice)) game_state->player_scores[player_id][8][2] = 25;
     if (has_small_straight(dice)) game_state->player_scores[player_id][9][2] = 30;
     if (has_large_straight(dice)) game_state->player_scores[player_id][10][2] = 40;
-    if (has_n_of_a_kind(dice, 5)) game_state->player_scores[player_id][11][2] = 50;
-    
+
+    if (has_n_of_a_kind(dice, 5)) {
+        game_state->player_scores[player_id][11][2] = 50;
+        // required upper section for forced-scoring rule
+        game_state->required_upper_section[player_id] = dice[0] - 1; // 0..5
+    }
+
     // Chance
     int sum = 0;
     for (int i = 0; i < 5; i++) sum += dice[i];
     game_state->player_scores[player_id][12][2] = sum;
-    
+
+    // Joker rules: if yahtzee achieved earlier AND current roll is yahtzee, allow fixed lower scores
+    if (game_state->yahtzee_achieved[player_id] == 'Y' &&
+        game_state->player_scores[player_id][11][2] == 50) {
+        game_state->player_scores[player_id][8][2]  = 25; // full house
+        game_state->player_scores[player_id][9][2]  = 30; // small straight
+        game_state->player_scores[player_id][10][2] = 40; // large straight
+    }
+
     pthread_mutex_unlock(&game_state->game_mutex);
+}
+
+static void update_section_flags_nolock(int player_id) {
+    int c = 0;
+    for (int i = 0; i < 6; i++) if (game_state->player_scores[player_id][i][1] == 1) c++;
+    game_state->upper_section_filled[player_id] = (c == 6) ? 'Y' : 'N';
+
+    c = 0;
+    for (int i = 6; i <= 12; i++) if (game_state->player_scores[player_id][i][1] == 1) c++;
+    game_state->lower_section_filled[player_id] = (c == 7) ? 'Y' : 'N';
+}
+
+static int maybe_award_upper_bonus_nolock(int player_id) {
+    if (game_state->bonus_achieved[player_id] == 'Y') return 0;
+
+    int upper_total = 0;
+    for (int i = 0; i < 6; i++) upper_total += game_state->player_scores[player_id][i][0];
+
+    if (upper_total >= 63) {
+        game_state->player_scores[player_id][13][0] = 35;
+        game_state->player_scores[player_id][13][1] = 1;
+        game_state->bonus_achieved[player_id] = 'Y';
+        return 1;
+    }
+    return 0;
 }
 
 int apply_score(int player_id, int category) {
     pthread_mutex_lock(&game_state->game_mutex);
+
     if (category < 0 || category >= 13 || game_state->player_scores[player_id][category][1] == 1) {
         pthread_mutex_unlock(&game_state->game_mutex);
         return 0;
     }
+
     game_state->player_scores[player_id][category][0] = game_state->player_scores[player_id][category][2];
     game_state->player_scores[player_id][category][1] = 1;
+
+    // Track Yahtzee achieved
+    if (category == 11 && game_state->player_scores[player_id][category][0] == 50) {
+        game_state->yahtzee_achieved[player_id] = 'Y';
+    }
+
+    update_section_flags_nolock(player_id);
+    maybe_award_upper_bonus_nolock(player_id);
+
     pthread_mutex_unlock(&game_state->game_mutex);
     return 1;
 }
 
 int calculate_total_score(int player_id) {
-    int total = 0, upper_total = 0;
+    int total = 0;
+
     pthread_mutex_lock(&game_state->game_mutex);
-    for (int i = 0; i < 6; i++) upper_total += game_state->player_scores[player_id][i][0];
-    if (upper_total >= 63) {
-        game_state->player_scores[player_id][13][0] = 35;
-        total += 35;
+
+    // ensure upper bonus awarded if eligible
+    maybe_award_upper_bonus_nolock(player_id);
+
+    for (int i = 0; i < 15; i++) {
+        total += game_state->player_scores[player_id][i][0];
     }
-    for (int i = 0; i < 13; i++) total += game_state->player_scores[player_id][i][0];
+
     pthread_mutex_unlock(&game_state->game_mutex);
     return total;
 }
-
 
 // SHARED MEMORY INITIALIZATION [ARIANA]
 
@@ -219,7 +287,20 @@ int init_shared_memory() {
     game_state->game_finished = 0;
     
     for (int i = 0; i < MAX_PLAYERS; i++) {
+        
         game_state->player_connected[i] = 0;
+        game_state->total_wins[i] = 0;
+
+        // Member 1 rule state defaults
+        game_state->yahtzee_achieved[i] = 'N';
+        game_state->amount_yahtzee[i] = 0;
+        game_state->required_upper_section[i] = -1;
+        game_state->lower_section_only[i] = 'N';
+        game_state->skip_scoring[i] = 'N';
+        game_state->bonus_achieved[i] = 'N';
+        game_state->upper_section_filled[i] = 'N';
+        game_state->lower_section_filled[i] = 'N';
+
         memset(game_state->player_names[i], 0, NAME_SIZE);
         for (int j = 0; j < 15; j++) {
             for (int k = 0; k < 3; k++) {
@@ -362,7 +443,8 @@ void handle_client(int player_id, const char* client_fifo) {
                      game_state->player_rerolls_left[player_id]);
             write(write_fd, buffer, strlen(buffer));
             
-            n = read(read_fd, recv_buffer, sizeof(recv_buffer));
+            n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
+            if (n > 0) recv_buffer[n] = '\0';
             if (n <= 0) break;
             
             if (recv_buffer[0] == 'N' || recv_buffer[0] == 'n') break;
@@ -371,7 +453,8 @@ void handle_client(int player_id, const char* client_fifo) {
                 snprintf(buffer, sizeof(buffer), "Which dice? (e.g., 1 3 5): ");
                 write(write_fd, buffer, strlen(buffer));
                 
-                n = read(read_fd, recv_buffer, sizeof(recv_buffer));
+                n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
+            if (n > 0) recv_buffer[n] = '\0';
                 if (n <= 0) break;
                 
                 int dice_to_reroll[5];
@@ -403,47 +486,183 @@ void handle_client(int player_id, const char* client_fifo) {
         }
         
         calculate_possible_scores(player_id);
-        
-        snprintf(buffer, sizeof(buffer), "\n=== SCORING OPTIONS ===\n");
-        write(write_fd, buffer, strlen(buffer));
-        
-        for (int i = 0; i < 13; i++) {
-            if (game_state->player_scores[player_id][i][1] == 0) {
-                snprintf(buffer, sizeof(buffer), "%2d. %-20s | %d points\n",
-                         i + 1, categories[i],
-                         game_state->player_scores[player_id][i][2]);
+
+        //Yahtzee extra/Joker/forced rules [ALESHA]
+        pthread_mutex_lock(&game_state->game_mutex);
+
+        game_state->skip_scoring[player_id] = 'N';
+        game_state->lower_section_only[player_id] = 'N';
+
+        int rolled_yahtzee = (game_state->player_scores[player_id][11][2] == 50);
+
+        if (rolled_yahtzee) {
+            // required upper section already set by calculate_possible_scores()
+            if (game_state->amount_yahtzee[player_id] >= 1) {
+                // additional Yahtzee
+                snprintf(buffer, sizeof(buffer),
+                         "\n\nCongratulations! You scored another Yahtzee!\n");
                 write(write_fd, buffer, strlen(buffer));
-            }
-        }
-        
-        int valid = 0, choice;
-        while (!valid) {
-            snprintf(buffer, sizeof(buffer), "\nChoose category (1-13): ");
-            write(write_fd, buffer, strlen(buffer));
-            
-            n = read(read_fd, recv_buffer, sizeof(recv_buffer));
-            if (n <= 0) break;
-            
-            choice = atoi(recv_buffer);
-            if (choice >= 1 && choice <= 13 && 
-                game_state->player_scores[player_id][choice - 1][1] == 0) {
-                valid = 1;
+
+                game_state->amount_yahtzee[player_id] += 1;
+
+                // Yahtzee bonus (+100) only if Yahtzee box has been achieved earlier
+                if (game_state->yahtzee_achieved[player_id] == 'Y') {
+                    game_state->player_scores[player_id][14][0] += 100;
+                    game_state->player_scores[player_id][14][1] = 1;
+                    snprintf(buffer, sizeof(buffer),
+                             "Yahtzee bonus awarded! (+100)\n");
+                    write(write_fd, buffer, strlen(buffer));
+                }
+
+                // Forced upper section / lower-only flow applies when Yahtzee box is already filled
+                if (game_state->player_scores[player_id][11][1] == 1) {
+                    int req = game_state->required_upper_section[player_id]; // 0..5
+                    if (req >= 0 && req < 6 && game_state->player_scores[player_id][req][1] == 0) {
+                        // Auto-score required upper section
+                        game_state->player_scores[player_id][req][0] =
+                            game_state->player_scores[player_id][req][2];
+                        game_state->player_scores[player_id][req][1] = 1;
+
+                        snprintf(buffer, sizeof(buffer),
+                                 "Since you scored another Yahtzee and UPPER SECTION #%d is available,\n"
+                                 "it has been automatically filled with %d points.\n",
+                                 req + 1, game_state->player_scores[player_id][req][0]);
+                        write(write_fd, buffer, strlen(buffer));
+
+                        game_state->skip_scoring[player_id] = 'Y';
+                    } else if (req >= 0 && req < 6 &&
+                               game_state->player_scores[player_id][req][1] == 1 &&
+                               game_state->lower_section_filled[player_id] == 'N') {
+                        snprintf(buffer, sizeof(buffer),
+                                 "Since UPPER SECTION #%d is NOT available, you may use this Yahtzee\n"
+                                 "to score any LOWER SECTION category.\n",
+                                 req + 1);
+                        write(write_fd, buffer, strlen(buffer));
+                        game_state->lower_section_only[player_id] = 'Y';
+                    }
+                }
             } else {
-                snprintf(buffer, sizeof(buffer), "Invalid choice! Try again.\n");
+                // first Yahtzee roll
+                snprintf(buffer, sizeof(buffer),
+                         "\n\nCongratulations! You scored a Yahtzee!\n");
+                write(write_fd, buffer, strlen(buffer));
+                game_state->amount_yahtzee[player_id] = 1;
+            }
+        }
+
+        // Update section flags + bonus eligibility based on any auto-fill
+        update_section_flags_nolock(player_id);
+        maybe_award_upper_bonus_nolock(player_id);
+
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        // Scoring selection (skip if server auto-scored required upper box)
+        if (game_state->skip_scoring[player_id] == 'N') {
+            snprintf(buffer, sizeof(buffer), "\n=== SCORING OPTIONS ===\n");
+            write(write_fd, buffer, strlen(buffer));
+
+            if (game_state->lower_section_only[player_id] == 'N') {
+                for (int i = 0; i < 13; i++) {
+                    if (game_state->player_scores[player_id][i][1] == 0) {
+                        snprintf(buffer, sizeof(buffer), "%2d. %-20s | %d points\n",
+                                 i + 1, categories[i],
+                                 game_state->player_scores[player_id][i][2]);
+                        write(write_fd, buffer, strlen(buffer));
+                    }
+                }
+            } else {
+                for (int i = 6; i < 13; i++) {
+                    if (game_state->player_scores[player_id][i][1] == 0) {
+                        snprintf(buffer, sizeof(buffer), "%2d. %-20s | %d points\n",
+                                 i + 1, categories[i],
+                                 game_state->player_scores[player_id][i][2]);
+                        write(write_fd, buffer, strlen(buffer));
+                    }
+                }
+            }
+
+            int valid = 0, choice;
+            while (!valid) {
+                if (game_state->lower_section_only[player_id] == 'N') {
+                    snprintf(buffer, sizeof(buffer), "\nChoose category (1-13): ");
+                } else {
+                    snprintf(buffer, sizeof(buffer), "\nChoose LOWER category (7-13): ");
+                }
+                write(write_fd, buffer, strlen(buffer));
+
+                n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
+                if (n <= 0) break;
+                recv_buffer[n] = '\0';
+
+                choice = atoi(recv_buffer);
+
+                if (game_state->lower_section_only[player_id] == 'Y' && choice < 7) {
+                    valid = 0;
+                } else if (choice >= 1 && choice <= 13 &&
+                           game_state->player_scores[player_id][choice - 1][1] == 0) {
+                    valid = 1;
+                } else {
+                    snprintf(buffer, sizeof(buffer), "Invalid choice! Try again.\n");
+                    write(write_fd, buffer, strlen(buffer));
+                }
+            }
+
+            if (valid && apply_score(player_id, choice - 1)) {
+                snprintf(buffer, sizeof(buffer), "Scored %d points in %s!\n",
+                         game_state->player_scores[player_id][choice - 1][0],
+                         categories[choice - 1]);
                 write(write_fd, buffer, strlen(buffer));
             }
         }
-        
-        if (apply_score(player_id, choice - 1)) {
-            snprintf(buffer, sizeof(buffer), "Scored %d points in %s!\n",
-                     game_state->player_scores[player_id][choice - 1][0],
-                     categories[choice - 1]);
+
+        // Show current scorecard
+        pthread_mutex_lock(&game_state->game_mutex);
+
+        snprintf(buffer, sizeof(buffer), "\nCurrent Score:\nUpper Section\n");
+        write(write_fd, buffer, strlen(buffer));
+        for (int i = 0; i < 6; i++) {
+            snprintf(buffer, sizeof(buffer), "%2d. %-14s | %d %s\n",
+                     i + 1, categories[i], game_state->player_scores[player_id][i][0],
+                     (game_state->player_scores[player_id][i][1] ? "(Scored)" : "(Unscored)"));
             write(write_fd, buffer, strlen(buffer));
         }
-        
+
+        snprintf(buffer, sizeof(buffer), "\nLower Section\n");
+        write(write_fd, buffer, strlen(buffer));
+        for (int i = 6; i < 13; i++) {
+            snprintf(buffer, sizeof(buffer), "%2d. %-14s | %d %s\n",
+                     i + 1, categories[i], game_state->player_scores[player_id][i][0],
+                     (game_state->player_scores[player_id][i][1] ? "(Scored)" : "(Unscored)"));
+            write(write_fd, buffer, strlen(buffer));
+        }
+
+        // Bonus progress info
+        int upper_total = 0;
+        for (int i = 0; i < 6; i++) upper_total += game_state->player_scores[player_id][i][0];
+
+        if (game_state->bonus_achieved[player_id] == 'N') {
+            int pts_to_bonus = (upper_total < 63) ? (63 - upper_total) : 0;
+            snprintf(buffer, sizeof(buffer),
+                     "\nYou need %d more points in the UPPER SECTION to receive the 35-point bonus.\n",
+                     pts_to_bonus);
+            write(write_fd, buffer, strlen(buffer));
+        } else {
+            snprintf(buffer, sizeof(buffer),
+                     "\nUpper bonus achieved! (+35)\n");
+            write(write_fd, buffer, strlen(buffer));
+        }
+
+        if (game_state->player_scores[player_id][14][1] == 1) {
+            snprintf(buffer, sizeof(buffer),
+                     "Yahtzee bonus total: %d\n", game_state->player_scores[player_id][14][0]);
+            write(write_fd, buffer, strlen(buffer));
+        }
+
+        pthread_mutex_unlock(&game_state->game_mutex);
+
         snprintf(buffer, sizeof(buffer), "Turn complete. Waiting for other players...\n");
         write(write_fd, buffer, strlen(buffer));
-    }
+}
     
     if (game_state->game_finished) {
         int final_score = calculate_total_score(player_id);
