@@ -27,7 +27,7 @@
 typedef struct {
     int current_turn;
     int active_players;
-    int target_players;      // chosen by host 
+    int target_players;      // chosen by host
     int host_player_id;      // first connected player
     int game_started;
     int game_round;
@@ -54,8 +54,6 @@ typedef struct {
     pthread_mutex_t game_mutex;
     pthread_mutex_t log_mutex;
     sem_t turn_sem[MAX_PLAYERS];
-    // Start barrier: each player waits here until server starts the game.
-    sem_t start_sem[MAX_PLAYERS];
 
     int total_wins[MAX_PLAYERS];
 } GameState;
@@ -179,7 +177,7 @@ void calculate_possible_scores(int player_id) {
     for (int i = 0; i < 5; i++) sum += dice[i];
     game_state->player_scores[player_id][12][2] = sum;
 
-    // Joker rules (Member 1): if yahtzee achieved earlier AND current roll is yahtzee, allow fixed lower scores
+    // Joker rules: if yahtzee achieved earlier AND current roll is yahtzee, allow fixed lower scores
     if (game_state->yahtzee_achieved[player_id] == 'Y' &&
         game_state->player_scores[player_id][11][2] == 50) {
         game_state->player_scores[player_id][8][2]  = 25; // full house
@@ -296,7 +294,6 @@ int init_shared_memory() {
     // init semaphores as process-shared
     for (int i = 0; i < MAX_PLAYERS; i++) {
         sem_init(&game_state->turn_sem[i], 1, 0);
-        sem_init(&game_state->start_sem[i], 1, 0);
     }
 
     // defaults
@@ -434,8 +431,8 @@ void handle_client(int player_id, const char* client_fifo) {
              game_state->player_names[player_id], player_id + 1);
     write(write_fd, buffer, strlen(buffer));
 
-    // HOST SETUP
-    // First connected player becomes the host and chooses the target player count
+    // HOST SETUP 
+    // First connected player becomes the host and chooses the target player count.
     pthread_mutex_lock(&game_state->game_mutex);
     if (game_state->host_player_id < 0) {
         game_state->host_player_id = player_id;
@@ -512,9 +509,15 @@ void handle_client(int player_id, const char* client_fifo) {
     snprintf(buffer, sizeof(buffer), "Waiting for game to start...\n");
     write(write_fd, buffer, strlen(buffer));
     
-    // Start barrier: wait until server posts our start semaphore.
-    // This avoids "some clients stuck" issues caused by polling/visibility.
-    sem_wait(&game_state->start_sem[player_id]);
+    // Wait until server starts the game (protected by mutex so all processes see updates)
+    while (1) {
+        pthread_mutex_lock(&game_state->game_mutex);
+        int started = game_state->game_started;
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        if (started) break;
+        sleep(1);
+    }
     
     snprintf(buffer, sizeof(buffer), "\n*** GAME STARTING! ***\n\n");
     write(write_fd, buffer, strlen(buffer));
@@ -671,7 +674,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        // Scoring selection (skip if server auto-scored required upper box)
+        // Scoring selection (skip if server auto-scored required upper box) 
         if (game_state->skip_scoring[player_id] == 'N') {
             snprintf(buffer, sizeof(buffer), "\n=== SCORING OPTIONS ===\n");
             write(write_fd, buffer, strlen(buffer));
@@ -804,8 +807,6 @@ void handle_client(int player_id, const char* client_fifo) {
 
 // ROUND ROBIN SCHEDULER [AMIRAH]
 // The current scheduler is the simplified one to test synchronization
-// Need more improvement
-
 
 void* scheduler_thread(void* arg) {
     printf("[SCHEDULER] Scheduler thread started\n");
@@ -845,8 +846,8 @@ int main() {
 
     printf("\n");
     printf("╔═══════════════════════════════════════════╗\n");
-    printf("║  YAHTZEE SERVER (Single-Machine Mode)     ║\n");
-    printf("║  CSN6214 Operating Systems Assignment     ║\n");
+    printf("║  YAHTZEE SERVER (Single-Machine Mode)    ║\n");
+    printf("║  CSN6214 Operating Systems Assignment    ║\n");
     printf("╚═══════════════════════════════════════════╝\n");
     printf("\n");
 
@@ -980,21 +981,8 @@ int main() {
         int connected = game_state->active_players;
 
         if (!scheduler_created && !game_state->game_started && target > 0 && connected >= target) {
-            // Mark game started and snapshot who should be released from the lobby barrier.
-            int start_list[MAX_PLAYERS];
-            int start_count = 0;
             game_state->game_started = 1;
-            for (int i = 0; i < MAX_PLAYERS; i++) {
-                if (game_state->player_connected[i]) {
-                    start_list[start_count++] = i;
-                }
-            }
             pthread_mutex_unlock(&game_state->game_mutex);
-
-            // Release all currently connected players (host + others)
-            for (int i = 0; i < start_count; i++) {
-                sem_post(&game_state->start_sem[start_list[i]]);
-            }
 
             pthread_create(&scheduler_tid, NULL, scheduler_thread, NULL);
             scheduler_created = 1;
