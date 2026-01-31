@@ -27,6 +27,8 @@
 typedef struct {
     int current_turn;
     int active_players;
+    int target_players;      // chosen by host 
+    int host_player_id;      // first connected player
     int game_started;
     int game_round;
     int game_finished;
@@ -39,6 +41,7 @@ typedef struct {
 
     int  player_scores[MAX_PLAYERS][15][3];
 
+    // Full Yahtzee rule state (per player)
     char yahtzee_achieved[MAX_PLAYERS];        // 'Y' once Yahtzee box scored with 50
     int  amount_yahtzee[MAX_PLAYERS];          // number of Yahtzee rolls obtained so far
     int  required_upper_section[MAX_PLAYERS];  // 0..5 (aces..sixes) when a Yahtzee is rolled
@@ -51,6 +54,8 @@ typedef struct {
     pthread_mutex_t game_mutex;
     pthread_mutex_t log_mutex;
     sem_t turn_sem[MAX_PLAYERS];
+    // Start barrier: each player waits here until server starts the game.
+    sem_t start_sem[MAX_PLAYERS];
 
     int total_wins[MAX_PLAYERS];
 } GameState;
@@ -174,7 +179,7 @@ void calculate_possible_scores(int player_id) {
     for (int i = 0; i < 5; i++) sum += dice[i];
     game_state->player_scores[player_id][12][2] = sum;
 
-    // Joker rules: if yahtzee achieved earlier AND current roll is yahtzee, allow fixed lower scores
+    // Joker rules (Member 1): if yahtzee achieved earlier AND current roll is yahtzee, allow fixed lower scores
     if (game_state->yahtzee_achieved[player_id] == 'Y' &&
         game_state->player_scores[player_id][11][2] == 50) {
         game_state->player_scores[player_id][8][2]  = 25; // full house
@@ -252,46 +257,62 @@ int calculate_total_score(int player_id) {
 // SHARED MEMORY INITIALIZATION [ARIANA]
 
 int init_shared_memory() {
+    // Always start with a clean shared memory region (prevents stale game_started/target values)
+    shm_unlink("/yahtzee_shm");
+
     int shm_fd = shm_open("/yahtzee_shm", O_CREAT | O_RDWR, 0666);
     if (shm_fd == -1) {
         perror("shm_open failed");
         return -1;
     }
-    
+
     if (ftruncate(shm_fd, sizeof(GameState)) == -1) {
         perror("ftruncate failed");
+        close(shm_fd);
         return -1;
     }
-    
-    game_state = (GameState*) mmap(NULL, sizeof(GameState), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+
+    game_state = (GameState*) mmap(NULL, sizeof(GameState),
+                                   PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (game_state == MAP_FAILED) {
         perror("mmap failed");
+        close(shm_fd);
         return -1;
     }
-    
+
+    // Zero everything so no old values remain
+    memset(game_state, 0, sizeof(GameState));
+
+    // init mutexes as process-shared
     pthread_mutexattr_t mutex_attr;
     pthread_mutexattr_init(&mutex_attr);
     pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+
     pthread_mutex_init(&game_state->game_mutex, &mutex_attr);
     pthread_mutex_init(&game_state->log_mutex, &mutex_attr);
+
     pthread_mutexattr_destroy(&mutex_attr);
-    
+
+    // init semaphores as process-shared
     for (int i = 0; i < MAX_PLAYERS; i++) {
         sem_init(&game_state->turn_sem[i], 1, 0);
+        sem_init(&game_state->start_sem[i], 1, 0);
     }
-    
-    game_state->current_turn = 0;
+
+    // defaults
+    game_state->current_turn   = 0;
     game_state->active_players = 0;
-    game_state->game_started = 0;
-    game_state->game_round = 1;
-    game_state->game_finished = 0;
-    
+    game_state->target_players = 0;   // host must set
+    game_state->host_player_id = -1;
+    game_state->game_started   = 0;
+    game_state->game_round     = 1;
+    game_state->game_finished  = 0;
+
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        
         game_state->player_connected[i] = 0;
         game_state->total_wins[i] = 0;
 
-        // Member 1 rule state defaults
+        // Rule state defaults
         game_state->yahtzee_achieved[i] = 'N';
         game_state->amount_yahtzee[i] = 0;
         game_state->required_upper_section[i] = -1;
@@ -302,16 +323,18 @@ int init_shared_memory() {
         game_state->lower_section_filled[i] = 'N';
 
         memset(game_state->player_names[i], 0, NAME_SIZE);
+
         for (int j = 0; j < 15; j++) {
             for (int k = 0; k < 3; k++) {
                 game_state->player_scores[i][j][k] = 0;
             }
         }
     }
-    
-    printf("✓ Shared memory initialized\n");
+
+    printf("✓ Shared memory initialized (fresh)\n");
     return 0;
 }
+
 
 
 // ZOMBIE REAPING (SIGCHLD) [ARIANA]
@@ -359,6 +382,23 @@ int setup_ipc_server() {
     return 0;
 }
 
+// If we need to reject a client after receiving its FIFO path, we must open BOTH ends once,
+// otherwise the client can block forever opening its own FIFOs.
+static void reject_client(const char* client_fifo, const char* msg) {
+    char client_read_fifo[256];
+    snprintf(client_read_fifo, sizeof(client_read_fifo), "%s_read", client_fifo);
+
+    int wfd = open(client_fifo, O_WRONLY);           // blocks until client opens read end
+    int rfd = open(client_read_fifo, O_RDONLY);      // blocks until client opens write end
+
+    if (wfd >= 0) {
+        write(wfd, msg, strlen(msg));
+        close(wfd);
+    }
+    if (rfd >= 0) close(rfd);
+}
+
+
 
 // CLIENT HANDLER (Child Process) [ARIANA]
 
@@ -393,13 +433,88 @@ void handle_client(int player_id, const char* client_fifo) {
     snprintf(buffer, sizeof(buffer), "Welcome %s! You are Player %d\n",
              game_state->player_names[player_id], player_id + 1);
     write(write_fd, buffer, strlen(buffer));
-    
+
+    // HOST SETUP
+    // First connected player becomes the host and chooses the target player count
+    pthread_mutex_lock(&game_state->game_mutex);
+    if (game_state->host_player_id < 0) {
+        game_state->host_player_id = player_id;
+    }
+    int host_id = game_state->host_player_id;
+    pthread_mutex_unlock(&game_state->game_mutex);
+
+    if (player_id == host_id) {
+        // Host chooses player count once
+        while (1) {
+            pthread_mutex_lock(&game_state->game_mutex);
+            int target = game_state->target_players;
+            int connected = game_state->active_players;
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            if (target > 0) break;
+
+            snprintf(buffer, sizeof(buffer),
+                     "\n[HOST SETUP] Enter number of players for this game (3-%d): ",
+                     MAX_PLAYERS);
+            write(write_fd, buffer, strlen(buffer));
+
+            n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
+            if (n <= 0) {
+                // client disconnected
+                close(write_fd);
+                close(read_fd);
+                exit(0);
+            }
+            recv_buffer[n] = '\0';
+            int t = atoi(recv_buffer);
+
+            if (t >= 3 && t <= MAX_PLAYERS) {
+                pthread_mutex_lock(&game_state->game_mutex);
+                game_state->target_players = t;
+                pthread_mutex_unlock(&game_state->game_mutex);
+
+                snprintf(buffer, sizeof(buffer),
+                         "✓ Lobby set to %d players. Currently connected: %d/%d\n"
+                         "Waiting for remaining players to join...\n",
+                         t, connected, t);
+                write(write_fd, buffer, strlen(buffer));
+                break;
+            } else {
+                snprintf(buffer, sizeof(buffer),
+                         "Invalid number. Please enter a value between 3 and %d.\n",
+                         MAX_PLAYERS);
+                write(write_fd, buffer, strlen(buffer));
+            }
+        }
+    } else {
+        // Non-host players wait until host chooses the target count
+        snprintf(buffer, sizeof(buffer),
+                 "Waiting for host to choose number of players...\n");
+        write(write_fd, buffer, strlen(buffer));
+
+        while (1) {
+            pthread_mutex_lock(&game_state->game_mutex);
+            int target = game_state->target_players;
+            int connected = game_state->active_players;
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            if (target > 0) {
+                snprintf(buffer, sizeof(buffer),
+                         "Host selected %d players. Currently connected: %d/%d\n",
+                         target, connected, target);
+                write(write_fd, buffer, strlen(buffer));
+                break;
+            }
+            sleep(1);
+        }
+    }
+
     snprintf(buffer, sizeof(buffer), "Waiting for game to start...\n");
     write(write_fd, buffer, strlen(buffer));
     
-    while (!game_state->game_started) {
-        sleep(1);
-    }
+    // Start barrier: wait until server posts our start semaphore.
+    // This avoids "some clients stuck" issues caused by polling/visibility.
+    sem_wait(&game_state->start_sem[player_id]);
     
     snprintf(buffer, sizeof(buffer), "\n*** GAME STARTING! ***\n\n");
     write(write_fd, buffer, strlen(buffer));
@@ -487,7 +602,7 @@ void handle_client(int player_id, const char* client_fifo) {
         
         calculate_possible_scores(player_id);
 
-        //Yahtzee extra/Joker/forced rules [ALESHA]
+        // Yahtzee extra/Joker/forced rules [ALESHA]
         pthread_mutex_lock(&game_state->game_mutex);
 
         game_state->skip_scoring[player_id] = 'N';
@@ -712,10 +827,10 @@ void* scheduler_thread(void* arg) {
             pthread_mutex_unlock(&game_state->game_mutex);
         }
         
-        turn_index = (turn_index + 1) % MAX_PLAYERS;
-        if (turn_index >= game_state->active_players) turn_index = 0;
-        
-        sleep(1);
+        int limit = (game_state->target_players > 0) ? game_state->target_players : game_state->active_players;
+        if (limit <= 0) limit = MAX_PLAYERS;
+        turn_index = (turn_index + 1) % limit;
+sleep(1);
     }
     
     printf("[SCHEDULER] Scheduler thread ending\n");
@@ -727,94 +842,175 @@ void* scheduler_thread(void* arg) {
 
 int main() {
     srand(time(NULL));
-    
+
     printf("\n");
     printf("╔═══════════════════════════════════════════╗\n");
     printf("║  YAHTZEE SERVER (Single-Machine Mode)    ║\n");
     printf("║  CSN6214 Operating Systems Assignment    ║\n");
     printf("╚═══════════════════════════════════════════╝\n");
     printf("\n");
-    
+
     if (init_shared_memory() < 0) {
         fprintf(stderr, "Failed to initialize shared memory\n");
         return 1;
     }
-    
+
     setup_signal_handlers();
-    
+
     if (setup_ipc_server() < 0) {
         fprintf(stderr, "Failed to setup IPC\n");
         return 1;
     }
-    
+
     printf("\nServer ready! Waiting for players...\n");
-    printf("(Need 3-5 players to start)\n");
+    printf("Host (Player 1) will choose how many players to start (3-%d)\n", MAX_PLAYERS);
     printf("----------------------------------------\n");
-    
+
     pthread_t scheduler_tid;
     int scheduler_created = 0;
-    
-    while (1) {
-        int server_fd = open(SERVER_FIFO, O_RDONLY);
-        if (server_fd < 0) {
-            perror("open server FIFO");
-            continue;
-        }
-        
-        char client_fifo[256];
-        int n = read(server_fd, client_fifo, sizeof(client_fifo) - 1);
-        close(server_fd);
-        
-        if (n <= 0) continue;
-        
-        client_fifo[n] = '\0';
-        client_fifo[strcspn(client_fifo, "\n")] = '\0';
-        
-        printf("[CONNECTION] New connection request\n");
-        
-        pthread_mutex_lock(&game_state->game_mutex);
-        int player_id = -1;
-        for (int i = 0; i < MAX_PLAYERS; i++) {
-            if (!game_state->player_connected[i]) {
-                player_id = i;
-                game_state->player_connected[i] = 1;
-                game_state->active_players++;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&game_state->game_mutex);
-        
-        if (player_id == -1) {
-            printf("[CONNECTION] Rejected - server full\n");
-            continue;
-        }
-        
-        printf("[CONNECTION] Player %d assigned (%d/%d players)\n",
-               player_id + 1, game_state->active_players, MAX_PLAYERS);
-        
-        pid_t pid = fork();
-        
-        if (pid < 0) {
-            perror("fork failed");
-            pthread_mutex_lock(&game_state->game_mutex);
-            game_state->player_connected[player_id] = 0;
-            game_state->active_players--;
-            pthread_mutex_unlock(&game_state->game_mutex);
-        } else if (pid == 0) {
-            handle_client(player_id, client_fifo);
-            exit(0);
-        } else {
-            printf("[FORK] Created child process PID %d for Player %d\n", pid, player_id + 1);
-            
-            if (game_state->active_players >= 3 && !scheduler_created) {
-                game_state->game_started = 1;
-                pthread_create(&scheduler_tid, NULL, scheduler_thread, NULL);
-                scheduler_created = 1;
-                printf("\n*** GAME STARTING with %d players! ***\n\n", game_state->active_players);
-            }
-        }
+
+    // Keep the server FIFO open (RDWR prevents EOF when no writers)
+    int server_fd = open(SERVER_FIFO, O_RDWR | O_NONBLOCK);
+    if (server_fd < 0) {
+        perror("open server FIFO");
+        return 1;
     }
-    
+
+    // Small line buffer for FIFO messages (client fifo path per line)
+    char accum[2048];
+    size_t accum_len = 0;
+
+    while (1) {
+        // 1) Read connection requests (non-blocking)
+        char buf[256];
+        int n = read(server_fd, buf, sizeof(buf));
+        if (n > 0) {
+            // append to accumulator
+            size_t to_copy = (size_t)n;
+            if (accum_len + to_copy >= sizeof(accum)) {
+                // reset if overflow
+                accum_len = 0;
+            }
+            memcpy(accum + accum_len, buf, to_copy);
+            accum_len += to_copy;
+
+            // process complete lines
+            size_t start = 0;
+            for (size_t i = 0; i < accum_len; i++) {
+                if (accum[i] == '\n') {
+                    char client_fifo[256];
+                    size_t line_len = i - start;
+                    if (line_len >= sizeof(client_fifo)) line_len = sizeof(client_fifo) - 1;
+                    memcpy(client_fifo, accum + start, line_len);
+                    client_fifo[line_len] = '\0';
+
+                    // advance start past newline
+                    start = i + 1;
+
+                    // ignore empty lines
+                    if (client_fifo[0] == '\0') continue;
+
+                    pthread_mutex_lock(&game_state->game_mutex);
+                    int already_started = game_state->game_started;
+                    pthread_mutex_unlock(&game_state->game_mutex);
+
+                    if (already_started) {
+                        printf("[CONNECTION] Rejected - game already started\n");
+                        reject_client(client_fifo,
+                                      "Server: Game already started. Please restart server for a new game.\n");
+                        continue;
+                    }
+
+                    printf("[CONNECTION] New connection request\n");
+
+                    pthread_mutex_lock(&game_state->game_mutex);
+                    int player_id = -1;
+                    for (int p = 0; p < MAX_PLAYERS; p++) {
+                        if (!game_state->player_connected[p]) {
+                            player_id = p;
+                            game_state->player_connected[p] = 1;
+                            game_state->active_players++;
+                            if (game_state->host_player_id < 0) game_state->host_player_id = p;
+                            break;
+                        }
+                    }
+                    int connected_now = game_state->active_players;
+                    pthread_mutex_unlock(&game_state->game_mutex);
+
+                    if (player_id == -1) {
+                        printf("[CONNECTION] Rejected - server full\n");
+                        reject_client(client_fifo,
+                                      "Server: Full (max players reached). Try again later.\n");
+                        continue;
+                    }
+
+                    printf("[CONNECTION] Player %d assigned (%d/%d connected)\n",
+                           player_id + 1, connected_now, MAX_PLAYERS);
+
+                    pid_t pid = fork();
+                    if (pid < 0) {
+                        perror("fork failed");
+                        pthread_mutex_lock(&game_state->game_mutex);
+                        game_state->player_connected[player_id] = 0;
+                        game_state->active_players--;
+                        pthread_mutex_unlock(&game_state->game_mutex);
+                        reject_client(client_fifo, "Server: internal error (fork failed)\n");
+                    } else if (pid == 0) {
+                        handle_client(player_id, client_fifo);
+                        exit(0);
+                    } else {
+                        printf("[FORK] Created child process PID %d for Player %d\n",
+                               pid, player_id + 1);
+                    }
+                }
+            }
+
+            // compact accumulator (remove processed bytes)
+            if (start > 0) {
+                memmove(accum, accum + start, accum_len - start);
+                accum_len -= start;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("read server FIFO");
+        }
+
+        // 2) Start game when host has chosen target and enough players are connected
+        pthread_mutex_lock(&game_state->game_mutex);
+        int target = game_state->target_players;
+        int connected = game_state->active_players;
+
+        if (!scheduler_created && !game_state->game_started && target > 0 && connected >= target) {
+            // Mark game started and snapshot who should be released from the lobby barrier.
+            int start_list[MAX_PLAYERS];
+            int start_count = 0;
+            game_state->game_started = 1;
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                if (game_state->player_connected[i]) {
+                    start_list[start_count++] = i;
+                }
+            }
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            // Release all currently connected players (host + others)
+            for (int i = 0; i < start_count; i++) {
+                sem_post(&game_state->start_sem[start_list[i]]);
+            }
+
+            pthread_create(&scheduler_tid, NULL, scheduler_thread, NULL);
+            scheduler_created = 1;
+
+            printf("\n*** GAME STARTING with %d players! ***\n\n", target);
+        } else {
+            pthread_mutex_unlock(&game_state->game_mutex);
+        }
+
+        // small sleep to avoid busy loop
+        struct timespec ts = {0, 100000000}; // 100ms
+        nanosleep(&ts, NULL);
+    }
+
+    // not reached in normal run
+    close(server_fd);
     munmap(game_state, sizeof(GameState));
     shm_unlink("/yahtzee_shm");
     return 0;
