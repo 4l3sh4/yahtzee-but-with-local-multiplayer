@@ -19,7 +19,7 @@ int main() {
     
     printf("\n");
     printf("╔═══════════════════════════════════════╗\n");
-    printf("║       YAHTZEE GAME CLIENT v1.0        ║\n");
+    printf("║          YAHTZEE GAME CLIENT          ║\n");
     printf("║   SINGLE-MACHINE MODE (Named Pipes)   ║\n");
     printf("╚═══════════════════════════════════════╝\n");
     printf("\n");
@@ -57,8 +57,9 @@ int main() {
         return 1;
     }
     
-    // Send our FIFO name to server
+    // Send our FIFO name to server (newline-terminated so server can parse)
     write(server_fd, client_write_fifo, strlen(client_write_fifo));
+    write(server_fd, "\n", 1);
     close(server_fd);
     
     // Open our FIFOs for communication
