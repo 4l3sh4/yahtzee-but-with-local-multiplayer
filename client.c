@@ -19,7 +19,7 @@ int main() {
     
     printf("\n");
     printf("╔═══════════════════════════════════════╗\n");
-    printf("║          YAHTZEE GAME CLIENT          ║\n");
+    printf("║              YAHTZEE GAME             ║\n");
     printf("║   SINGLE-MACHINE MODE (Named Pipes)   ║\n");
     printf("╚═══════════════════════════════════════╝\n");
     printf("\n");
@@ -57,10 +57,17 @@ int main() {
         return 1;
     }
     
-    // Send our FIFO name to server (newline-terminated so server can parse)
-    write(server_fd, client_write_fifo, strlen(client_write_fifo));
-    write(server_fd, "\n", 1);
+    // Send our FIFO name to server
+    {
+        char line[512];
+        // send newline so server can parse one FIFO path per line
+        snprintf(line, sizeof(line), "%s\n", client_write_fifo);
+        if (write(server_fd, line, strlen(line)) < 0) {
+            perror("write to server fifo failed");
+        }
+    }
     close(server_fd);
+
     
     // Open our FIFOs for communication
     read_fd = open(client_write_fifo, O_RDONLY);
@@ -101,14 +108,28 @@ int main() {
         printf("%s", buffer);
         fflush(stdout);
         
-        // Check if server is asking for input
-        if (strstr(buffer, "Enter") || 
-            strstr(buffer, "Choose") || 
-            strstr(buffer, "choose") ||
-            strstr(buffer, "Which") ||
-            strstr(buffer, "Reroll?") ||
-            (strstr(buffer, ": ") && 
-             (buffer[strlen(buffer)-1] == ' ' || buffer[strlen(buffer)-2] == ':'))) {
+        // Check if server is asking for input.
+        int needs_input = 0;
+
+        // Common gameplay prompts
+        if (strstr(buffer, "Enter your name")) needs_input = 1;
+        if (strstr(buffer, "Reroll?")) needs_input = 1;
+        if (strstr(buffer, "Which dice")) needs_input = 1;
+        if (strstr(buffer, "Choose category")) needs_input = 1;
+        if (strstr(buffer, "Choose LOWER category")) needs_input = 1;
+        if (strstr(buffer, "Choose where")) needs_input = 1;
+
+        // Host lobby prompt
+        if (strstr(buffer, "Enter number of players")) needs_input = 1;
+
+        {
+            size_t len = strlen(buffer);
+            if (len >= 2 && buffer[len - 2] == ':' && buffer[len - 1] == ' ') {
+                needs_input = 1;
+            }
+        }
+
+        if (needs_input) {
             
             // Get user input
             if (fgets(input, sizeof(input), stdin) != NULL) {
