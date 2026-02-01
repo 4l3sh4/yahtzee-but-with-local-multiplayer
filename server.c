@@ -254,7 +254,7 @@ int calculate_total_score(int player_id) {
 // SHARED MEMORY INITIALIZATION [ARIANA]
 
 int init_shared_memory() {
-    // Always start with a clean shared memory to prevent stale game_started/target values
+    // Always start with a clean shared memory region to prevent stale game_started/target values
     shm_unlink("/yahtzee_shm");
 
     int shm_fd = shm_open("/yahtzee_shm", O_CREAT | O_RDWR, 0666);
