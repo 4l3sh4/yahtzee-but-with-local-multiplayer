@@ -108,7 +108,7 @@ int main() {
         printf("%s", buffer);
         fflush(stdout);
         
-        // Check if server is asking for input.
+        // Check if server is asking for input
         int needs_input = 0;
 
         // Common gameplay prompts
