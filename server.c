@@ -838,10 +838,10 @@ int main() {
     srand(time(NULL));
 
     printf("\n");
-    printf("╔═══════════════════════════════════════════╗\n");
-    printf("║  YAHTZEE SERVER (Single-Machine Mode)    ║\n");
-    printf("║  CSN6214 Operating Systems Assignment    ║\n");
-    printf("╚═══════════════════════════════════════════╝\n");
+    printf("╔════════════════════════════════════════════╗\n");
+    printf("║    YAHTZEE SERVER (Single-Machine Mode)    ║\n");
+    printf("║    CSN6214 Operating Systems Assignment    ║\n");
+    printf("╚════════════════════════════════════════════╝\n");
     printf("\n");
 
     if (init_shared_memory() < 0) {
