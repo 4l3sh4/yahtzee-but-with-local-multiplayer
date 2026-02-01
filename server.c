@@ -27,8 +27,8 @@
 typedef struct {
     int current_turn;
     int active_players;
-    int target_players;      // chosen by host
-    int host_player_id;      // first connected player
+    int target_players;      
+    int host_player_id;      
     int game_started;
     int game_round;
     int game_finished;
@@ -41,15 +41,14 @@ typedef struct {
 
     int  player_scores[MAX_PLAYERS][15][3];
 
-    // Full Yahtzee rule state (per player)
-    char yahtzee_achieved[MAX_PLAYERS];        // 'Y' once Yahtzee box scored with 50
-    int  amount_yahtzee[MAX_PLAYERS];          // number of Yahtzee rolls obtained so far
-    int  required_upper_section[MAX_PLAYERS];  // 0..5 (aces..sixes) when a Yahtzee is rolled
-    char lower_section_only[MAX_PLAYERS];      // 'Y' when forced to score lower section (joker flow)
-    char skip_scoring[MAX_PLAYERS];            // 'Y' when server auto-scores required upper section
-    char bonus_achieved[MAX_PLAYERS];          // 'Y' once upper bonus awarded
-    char upper_section_filled[MAX_PLAYERS];    // 'Y' when aces..sixes all filled
-    char lower_section_filled[MAX_PLAYERS];    // 'Y' when categories 6..12 all filled
+    char yahtzee_achieved[MAX_PLAYERS];      
+    int  amount_yahtzee[MAX_PLAYERS];         
+    int  required_upper_section[MAX_PLAYERS];  
+    char lower_section_only[MAX_PLAYERS];     
+    char skip_scoring[MAX_PLAYERS];            
+    char bonus_achieved[MAX_PLAYERS];          
+    char upper_section_filled[MAX_PLAYERS];    
+    char lower_section_filled[MAX_PLAYERS];  
 
     pthread_mutex_t game_mutex;
     pthread_mutex_t log_mutex;
@@ -255,7 +254,7 @@ int calculate_total_score(int player_id) {
 // SHARED MEMORY INITIALIZATION [ARIANA]
 
 int init_shared_memory() {
-    // Always start with a clean shared memory region (prevents stale game_started/target values)
+    // Always start with a clean shared memory to prevent stale game_started/target values
     shm_unlink("/yahtzee_shm");
 
     int shm_fd = shm_open("/yahtzee_shm", O_CREAT | O_RDWR, 0666);
@@ -278,7 +277,6 @@ int init_shared_memory() {
         return -1;
     }
 
-    // Zero everything so no old values remain
     memset(game_state, 0, sizeof(GameState));
 
     // init mutexes as process-shared
@@ -296,10 +294,9 @@ int init_shared_memory() {
         sem_init(&game_state->turn_sem[i], 1, 0);
     }
 
-    // defaults
     game_state->current_turn   = 0;
     game_state->active_players = 0;
-    game_state->target_players = 0;   // host must set
+    game_state->target_players = 0;   
     game_state->host_player_id = -1;
     game_state->game_started   = 0;
     game_state->game_round     = 1;
@@ -309,7 +306,6 @@ int init_shared_memory() {
         game_state->player_connected[i] = 0;
         game_state->total_wins[i] = 0;
 
-        // Rule state defaults
         game_state->yahtzee_achieved[i] = 'N';
         game_state->amount_yahtzee[i] = 0;
         game_state->required_upper_section[i] = -1;
@@ -331,7 +327,6 @@ int init_shared_memory() {
     printf("✓ Shared memory initialized (fresh)\n");
     return 0;
 }
-
 
 
 // ZOMBIE REAPING (SIGCHLD) [ARIANA]
@@ -379,8 +374,7 @@ int setup_ipc_server() {
     return 0;
 }
 
-// If we need to reject a client after receiving its FIFO path, we must open BOTH ends once,
-// otherwise the client can block forever opening its own FIFOs.
+// open both ends once if we neeed to reject a client after receiving its FIFO path
 static void reject_client(const char* client_fifo, const char* msg) {
     char client_read_fifo[256];
     snprintf(client_read_fifo, sizeof(client_read_fifo), "%s_read", client_fifo);
@@ -431,8 +425,7 @@ void handle_client(int player_id, const char* client_fifo) {
              game_state->player_names[player_id], player_id + 1);
     write(write_fd, buffer, strlen(buffer));
 
-    // HOST SETUP 
-    // First connected player becomes the host and chooses the target player count.
+    // First connected player becomes the host and chooses the target player count
     pthread_mutex_lock(&game_state->game_mutex);
     if (game_state->host_player_id < 0) {
         game_state->host_player_id = player_id;
@@ -555,7 +548,7 @@ void handle_client(int player_id, const char* client_fifo) {
                  game_state->player_dice[player_id][4]);
         write(write_fd, buffer, strlen(buffer));
         
-        // Reroll phase
+        // Reroll [ALESHA]
         while (game_state->player_rerolls_left[player_id] > 0) {
             snprintf(buffer, sizeof(buffer), "\nRerolls left: %d. Reroll? (Y/N): ",
                      game_state->player_rerolls_left[player_id]);
@@ -806,7 +799,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
 
 // ROUND ROBIN SCHEDULER [AMIRAH]
-// The current scheduler is the simplified one to test synchronization
+// The current scheduler is the simplified one used to test synchronization
 
 void* scheduler_thread(void* arg) {
     printf("[SCHEDULER] Scheduler thread started\n");
@@ -882,7 +875,7 @@ int main() {
     size_t accum_len = 0;
 
     while (1) {
-        // 1) Read connection requests (non-blocking)
+        // Read connection requests (non-blocking)
         char buf[256];
         int n = read(server_fd, buf, sizeof(buf));
         if (n > 0) {
@@ -975,7 +968,7 @@ int main() {
             perror("read server FIFO");
         }
 
-        // 2) Start game when host has chosen target and enough players are connected
+        // Start game when host has chosen target and enough players are connected
         pthread_mutex_lock(&game_state->game_mutex);
         int target = game_state->target_players;
         int connected = game_state->active_players;
