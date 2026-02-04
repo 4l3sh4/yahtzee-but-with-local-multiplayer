@@ -53,6 +53,7 @@ typedef struct {
     pthread_mutex_t game_mutex;
     pthread_mutex_t log_mutex;
     sem_t turn_sem[MAX_PLAYERS];
+    sem_t turn_done_sem[MAX_PLAYERS];
 
     int total_wins[MAX_PLAYERS];
 } GameState;
@@ -292,6 +293,7 @@ int init_shared_memory() {
     // init semaphores as process-shared
     for (int i = 0; i < MAX_PLAYERS; i++) {
         sem_init(&game_state->turn_sem[i], 1, 0);
+        sem_init(&game_state->turn_done_sem[i], 1, 0);
     }
 
     game_state->current_turn   = 0;
@@ -773,6 +775,9 @@ void handle_client(int player_id, const char* client_fifo) {
 
         snprintf(buffer, sizeof(buffer), "Turn complete. Waiting for other players...\n");
         write(write_fd, buffer, strlen(buffer));
+
+        sem_post(&game_state->turn_done_sem[player_id]);
+
 }
     
     if (game_state->game_finished) {
@@ -783,8 +788,10 @@ void handle_client(int player_id, const char* client_fifo) {
     }
     
     pthread_mutex_lock(&game_state->game_mutex);
-    game_state->player_connected[player_id] = 0;
-    game_state->active_players--;
+    if (game_state->player_connected[player_id]) {
+        game_state->player_connected[player_id] = 0;
+        if (game_state->active_players > 0) game_state->active_players--;
+    }
     pthread_mutex_unlock(&game_state->game_mutex);
     
     snprintf(buffer, sizeof(buffer), "Disconnecting...\n");
@@ -799,38 +806,51 @@ void handle_client(int player_id, const char* client_fifo) {
 
 
 // ROUND ROBIN SCHEDULER [AMIRAH]
-// The current scheduler is the simplified one used to test synchronization
 
 void* scheduler_thread(void* arg) {
     printf("[SCHEDULER] Scheduler thread started\n");
-    
+
     int turn_index = 0;
-    
+
     while (!game_state->game_finished) {
         pthread_mutex_lock(&game_state->game_mutex);
-        
-        if (game_state->player_connected[turn_index]) {
-            game_state->current_turn = turn_index;
-            pthread_mutex_unlock(&game_state->game_mutex);
-            
+
+        int connected = game_state->player_connected[turn_index];
+        int limit = (game_state->target_players > 0) ? game_state->target_players : MAX_PLAYERS;
+
+        if (connected) game_state->current_turn = turn_index;
+
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        if (connected) {
             printf("[SCHEDULER] Signaling Player %d's turn\n", turn_index + 1);
+
             sem_post(&game_state->turn_sem[turn_index]);
-            
-            sleep(2);
-        } else {
-            pthread_mutex_unlock(&game_state->game_mutex);
+
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 30;
+
+            int rc = sem_timedwait(&game_state->turn_done_sem[turn_index], &ts);
+            if (rc == -1) {
+                if (errno == ETIMEDOUT) {
+                    printf("[SCHEDULER] Player %d timed out -> marking inactive\n", turn_index + 1);
+
+                    pthread_mutex_lock(&game_state->game_mutex);
+                    game_state->player_connected[turn_index] = 0;   // mark inactive
+                    pthread_mutex_unlock(&game_state->game_mutex);
+                } else {
+                    perror("[SCHEDULER] sem_timedwait");
+                }
+            }
         }
-        
-        int limit = (game_state->target_players > 0) ? game_state->target_players : game_state->active_players;
-        if (limit <= 0) limit = MAX_PLAYERS;
-        turn_index = (turn_index + 1) % limit;
-sleep(1);
+
+        turn_index = (turn_index + 1) % ((game_state->target_players > 0) ? game_state->target_players : MAX_PLAYERS);
     }
-    
+
     printf("[SCHEDULER] Scheduler thread ending\n");
     return NULL;
 }
-
 
 // MAIN FUNCTION [ARIANA]
 
