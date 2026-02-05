@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <time.h>
+#include <poll.h>
 
 // Configuration
 #define MAX_PLAYERS 5
@@ -23,7 +24,7 @@
 #define FIFO_DIR "/tmp/yahtzee"
 #define SERVER_FIFO "/tmp/yahtzee/server_fifo"
 
-#define QUANTUM_SECONDS 30
+#define QUANTUM_SECONDS 90
 
 // Shared Memory Structure
 typedef struct {
@@ -57,6 +58,7 @@ typedef struct {
     sem_t turn_sem[MAX_PLAYERS];
     sem_t turn_done_sem[MAX_PLAYERS];
     int  turn_active[MAX_PLAYERS];
+    int turn_timed_out[MAX_PLAYERS];
 
     int total_wins[MAX_PLAYERS];
 } GameState;
@@ -104,6 +106,31 @@ int has_large_straight(int dice[]) {
     for (int i = 0; i < 5; i++) present[dice[i]] = 1;
     return (present[1] && present[2] && present[3] && present[4] && present[5]) ||
            (present[2] && present[3] && present[4] && present[5] && present[6]);
+}
+
+static int read_line_or_timeout(int fd, char *buf, size_t bufsz, int player_id) {
+    size_t len = 0;
+    while (len + 1 < bufsz) {
+        // check timeout flag frequently
+        pthread_mutex_lock(&game_state->game_mutex);
+        int timed_out = game_state->turn_timed_out[player_id];
+        pthread_mutex_unlock(&game_state->game_mutex);
+        if (timed_out) return -2;
+
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 200); // 200ms tick
+        if (pr == 0) continue;       // no data, loop and re-check timeout
+        if (pr < 0) return -1;       // error
+
+        char c;
+        int n = (int)read(fd, &c, 1);
+        if (n <= 0) return 0;        // disconnect/EOF
+
+        buf[len++] = c;
+        if (c == '\n') break;
+    }
+    buf[len] = '\0';
+    return (int)len;
 }
 
 
@@ -311,7 +338,7 @@ int init_shared_memory() {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         game_state->player_connected[i] = 0;
         game_state->total_wins[i] = 0;
-
+        game_state->turn_timed_out[i] = 0;
         game_state->yahtzee_achieved[i] = 'N';
         game_state->amount_yahtzee[i] = 0;
         game_state->required_upper_section[i] = -1;
@@ -546,6 +573,52 @@ void handle_client(int player_id, const char* client_fifo) {
         pthread_mutex_unlock(&game_state->game_mutex);
         
         roll_dice(player_id);
+
+        /* --- SNAPSHOT FIRST ROLL POSSIBLE SCORES (FOR TIMEOUT AUTO-SCORE) --- */
+        int first_possible[13];
+
+        calculate_possible_scores(player_id);  // computes [][2] from FIRST roll
+
+        pthread_mutex_lock(&game_state->game_mutex);
+        for (int c = 0; c < 13; c++) {
+            first_possible[c] = game_state->player_scores[player_id][c][2];
+        }
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        DO_FORCED_SCORE:
+            pthread_mutex_lock(&game_state->game_mutex);
+            int timed_out = game_state->turn_timed_out[player_id];
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            if (timed_out) {
+                int cat = -1;
+
+                pthread_mutex_lock(&game_state->game_mutex);
+                for (int c = 0; c < 13; c++) {
+                    if (game_state->player_scores[player_id][c][1] == 0) {
+                        cat = c;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&game_state->game_mutex);
+
+                if (cat >= 0) {
+                    pthread_mutex_lock(&game_state->game_mutex);
+                    game_state->player_scores[player_id][cat][2] = first_possible[cat];
+                    pthread_mutex_unlock(&game_state->game_mutex);
+
+                    apply_score(player_id, cat);
+
+                    snprintf(buffer, sizeof(buffer),
+                            "\n[TIME UP] Auto-scored FIRST roll in %s for %d points.\n",
+                            categories[cat], first_possible[cat]);
+                    write(write_fd, buffer, strlen(buffer));
+                }
+
+                sem_post(&game_state->turn_done_sem[player_id]);
+                continue;   // NEXT ROUND
+            }
+
         
         snprintf(buffer, sizeof(buffer), "Your dice: [%d] [%d] [%d] [%d] [%d]\n",
                  game_state->player_dice[player_id][0],
@@ -561,9 +634,10 @@ void handle_client(int player_id, const char* client_fifo) {
                      game_state->player_rerolls_left[player_id]);
             write(write_fd, buffer, strlen(buffer));
             
-            n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
-            if (n > 0) recv_buffer[n] = '\0';
-            if (n <= 0) break;
+            int rr = read_line_or_timeout(read_fd, recv_buffer, sizeof(recv_buffer), player_id);
+            if (rr == -2) goto DO_FORCED_SCORE;   // time up
+            if (rr <= 0) break;                  // disconnect/error
+
             
             if (recv_buffer[0] == 'N' || recv_buffer[0] == 'n') break;
             
@@ -571,9 +645,9 @@ void handle_client(int player_id, const char* client_fifo) {
                 snprintf(buffer, sizeof(buffer), "Which dice? (e.g., 1 3 5): ");
                 write(write_fd, buffer, strlen(buffer));
                 
-                n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
-            if (n > 0) recv_buffer[n] = '\0';
-                if (n <= 0) break;
+                int rr = read_line_or_timeout(read_fd, recv_buffer, sizeof(recv_buffer), player_id);
+                if (rr == -2) goto DO_FORCED_SCORE;   // time up
+                if (rr <= 0) break;                  // disconnect/error
                 
                 int dice_to_reroll[5];
                 int count = 0;
@@ -708,9 +782,9 @@ void handle_client(int player_id, const char* client_fifo) {
                 }
                 write(write_fd, buffer, strlen(buffer));
 
-                n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
-                if (n <= 0) break;
-                recv_buffer[n] = '\0';
+                int rr = read_line_or_timeout(read_fd, recv_buffer, sizeof(recv_buffer), player_id);
+                if (rr == -2) goto DO_FORCED_SCORE;   // time up
+                if (rr <= 0) break;                  // disconnect/error
 
                 choice = atoi(recv_buffer);
 
@@ -778,6 +852,8 @@ void handle_client(int player_id, const char* client_fifo) {
 
         pthread_mutex_unlock(&game_state->game_mutex);
 
+        sem_post(&game_state->turn_done_sem[player_id]);
+
         snprintf(buffer, sizeof(buffer), "Turn complete. Waiting for other players...\n");
         write(write_fd, buffer, strlen(buffer));
 }
@@ -837,17 +913,16 @@ void* scheduler_thread(void* arg) {
             nanosleep(&nap, NULL);
             continue;
         }
-
+        
         game_state->current_turn = turn_index;
-        game_state->turn_active[turn_index] = 1;  // time slice starts
+        game_state->turn_active[turn_index] = 1;
+        game_state->turn_timed_out[turn_index] = 0;   // NEW: clear at start
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        printf("[SCHEDULER] Player %d gets CPU slice\n", turn_index + 1);
+        printf("[SCHEDULER] Player %d gets a turn (time limit %ds)\n", turn_index + 1, QUANTUM_SECONDS);
 
-        // give turn
         sem_post(&game_state->turn_sem[turn_index]);
 
-        // wait for done or timeout
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += QUANTUM_SECONDS;
@@ -855,17 +930,19 @@ void* scheduler_thread(void* arg) {
         int r = sem_timedwait(&game_state->turn_done_sem[turn_index], &ts);
 
         pthread_mutex_lock(&game_state->game_mutex);
-        game_state->turn_active[turn_index] = 0; // slice ends no matter what
+        game_state->turn_active[turn_index] = 0;
+
+        if (r == -1 && errno == ETIMEDOUT) {
+            game_state->turn_timed_out[turn_index] = 1;   // NEW: mark timeout
+        }
         pthread_mutex_unlock(&game_state->game_mutex);
 
         if (r == -1 && errno == ETIMEDOUT) {
-            printf("[SCHEDULER] Player %d quantum expired\n", turn_index + 1);
-            // optional: you can notify player through their FIFO if you store FDs (you don't)
+            printf("[SCHEDULER] Player %d time expired (forced scoring)\n", turn_index + 1);
         } else {
-            printf("[SCHEDULER] Player %d finished early\n", turn_index + 1);
+            printf("[SCHEDULER] Player %d finished their turn\n", turn_index + 1);
         }
 
-        turn_index = (turn_index + 1) % limit;
     }
 
     printf("[SCHEDULER] Scheduler ending\n");
