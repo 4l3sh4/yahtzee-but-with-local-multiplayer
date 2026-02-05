@@ -23,6 +23,8 @@
 #define FIFO_DIR "/tmp/yahtzee"
 #define SERVER_FIFO "/tmp/yahtzee/server_fifo"
 
+#define QUANTUM_SECONDS 30
+
 // Shared Memory Structure
 typedef struct {
     int current_turn;
@@ -53,7 +55,8 @@ typedef struct {
     pthread_mutex_t game_mutex;
     pthread_mutex_t log_mutex;
     sem_t turn_sem[MAX_PLAYERS];
-    sem_t done_sem[MAX_PLAYERS];
+    sem_t turn_done_sem[MAX_PLAYERS];
+    int  turn_active[MAX_PLAYERS];
 
     int total_wins[MAX_PLAYERS];
 } GameState;
@@ -293,7 +296,8 @@ int init_shared_memory() {
     // init semaphores as process-shared
     for (int i = 0; i < MAX_PLAYERS; i++) {
         sem_init(&game_state->turn_sem[i], 1, 0);
-        sem_init(&game_state->done_sem[i], 1, 0);   // NEW
+        sem_init(&game_state->turn_done_sem[i], 1, 0);
+        game_state->turn_active[i] = 0;
     }
 
     game_state->current_turn   = 0;
@@ -334,6 +338,7 @@ int init_shared_memory() {
 // ZOMBIE REAPING (SIGCHLD) [ARIANA]
 
 void sigchld_handler(int sig) {
+    (void)sig;
     int saved_errno = errno;
     pid_t pid;
     while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
@@ -525,51 +530,9 @@ void handle_client(int player_id, const char* client_fifo) {
     };
     
     for (int round = 1; round <= MAX_ROUNDS && !game_state->game_finished; round++) {
-
-        int turn_active = 0;
-        int last_announced_turn = -1;
-
-        while (1) {
-            // Wait up to 1 second for your turn signal
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 1;
-
-            if (sem_timedwait(&game_state->turn_sem[player_id], &ts) == 0) {
-                turn_active = 1; 
-                // It's your turn now
-                break;
-            }
-
-            if (errno != ETIMEDOUT) {
-                // Real error
-                perror("sem_timedwait");
-                break;
-            }
-
-            // Timeout: show "waiting" message if someone else is playing (and it changed)
-            pthread_mutex_lock(&game_state->game_mutex);
-            int cur = game_state->current_turn;
-            int started = game_state->game_started;
-            int connected = game_state->player_connected[player_id];
-            char cur_name[NAME_SIZE];
-            strncpy(cur_name, game_state->player_names[cur], NAME_SIZE - 1);
-            cur_name[NAME_SIZE - 1] = '\0';
-            pthread_mutex_unlock(&game_state->game_mutex);
-
-            if (!connected || !started || game_state->game_finished) break;
-
-            if (cur != player_id && cur != last_announced_turn) {
-                last_announced_turn = cur;
-
-                snprintf(buffer, sizeof(buffer),
-                        "\n[WAITING] Player %d (%s) is playing... please wait.\n",
-                        cur + 1, cur_name[0] ? cur_name : "Unknown");
-                write(write_fd, buffer, strlen(buffer));
-            }
-        }
-
-        if (!game_state->player_connected[player_id] || game_state->game_finished) break;
+        sem_wait(&game_state->turn_sem[player_id]);
+        
+        if (!game_state->player_connected[player_id]) break;
         
         snprintf(buffer, sizeof(buffer),
                  "\n========================================\n"
@@ -600,11 +563,8 @@ void handle_client(int player_id, const char* client_fifo) {
             
             n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
             if (n > 0) recv_buffer[n] = '\0';
-            if (n <= 0) {
-                if (turn_active) sem_post(&game_state->done_sem[player_id]); // NEW
-                break;
-            }
-
+            if (n <= 0) break;
+            
             if (recv_buffer[0] == 'N' || recv_buffer[0] == 'n') break;
             
             if (recv_buffer[0] == 'Y' || recv_buffer[0] == 'y') {
@@ -613,11 +573,8 @@ void handle_client(int player_id, const char* client_fifo) {
                 
                 n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
             if (n > 0) recv_buffer[n] = '\0';
-                if (n <= 0) {
-                    if (turn_active) sem_post(&game_state->done_sem[player_id]); // NEW
-                    break;
-                }
-
+                if (n <= 0) break;
+                
                 int dice_to_reroll[5];
                 int count = 0;
                 char *token = strtok(recv_buffer, " \n");
@@ -752,10 +709,7 @@ void handle_client(int player_id, const char* client_fifo) {
                 write(write_fd, buffer, strlen(buffer));
 
                 n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
-                if (n <= 0) {
-                    if (turn_active) sem_post(&game_state->done_sem[player_id]); // NEW
-                    break;
-                }
+                if (n <= 0) break;
                 recv_buffer[n] = '\0';
 
                 choice = atoi(recv_buffer);
@@ -826,9 +780,6 @@ void handle_client(int player_id, const char* client_fifo) {
 
         snprintf(buffer, sizeof(buffer), "Turn complete. Waiting for other players...\n");
         write(write_fd, buffer, strlen(buffer));
-
-        sem_post(&game_state->done_sem[player_id]);
-        turn_active = 0;
 }
     
     if (game_state->game_finished) {
@@ -855,46 +806,69 @@ void handle_client(int player_id, const char* client_fifo) {
 
 
 // ROUND ROBIN SCHEDULER [AMIRAH]
+// The current scheduler is the simplified one used to test synchronization
 
 void* scheduler_thread(void* arg) {
-    printf("[SCHEDULER] Round-robin scheduler started\n");
+    (void)arg;
+    printf("[SCHEDULER] RR Scheduler started (quantum=%ds)\n", QUANTUM_SECONDS);
+
+    int turn_index = 0;
 
     while (!game_state->game_finished) {
-
         pthread_mutex_lock(&game_state->game_mutex);
-        int target = game_state->target_players;
-        pthread_mutex_unlock(&game_state->game_mutex);
 
-        if (target <= 0) {
-            // Game not properly configured yet
-            sleep(1);
+        int limit = (game_state->target_players > 0)
+                      ? game_state->target_players
+                      : game_state->active_players;
+        if (limit <= 0) limit = MAX_PLAYERS;
+
+        // find next connected player
+        int start = turn_index;
+        while (limit > 0 && !game_state->player_connected[turn_index]) {
+            turn_index = (turn_index + 1) % limit;
+            if (turn_index == start) break;
+        }
+
+        if (!game_state->player_connected[turn_index]) {
+            pthread_mutex_unlock(&game_state->game_mutex);
+            struct timespec nap;
+            nap.tv_sec = 0;
+            nap.tv_nsec = 100000000; // 100ms
+            nanosleep(&nap, NULL);
             continue;
         }
 
-        // Strict order: Player 1 -> 2 -> ... -> target -> repeat
-        for (int turn_index = 0; turn_index < target && !game_state->game_finished; turn_index++) {
+        game_state->current_turn = turn_index;
+        game_state->turn_active[turn_index] = 1;  // time slice starts
+        pthread_mutex_unlock(&game_state->game_mutex);
 
-            pthread_mutex_lock(&game_state->game_mutex);
-            int connected = game_state->player_connected[turn_index];
-            game_state->current_turn = turn_index;
-            pthread_mutex_unlock(&game_state->game_mutex);
+        printf("[SCHEDULER] Player %d gets CPU slice\n", turn_index + 1);
 
-            if (!connected) {
-                // If someone disconnected, skip them but keep the RR order intact
-                continue;
-            }
+        // give turn
+        sem_post(&game_state->turn_sem[turn_index]);
 
-            printf("[SCHEDULER] Signaling Player %d's turn\n", turn_index + 1);
+        // wait for done or timeout
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += QUANTUM_SECONDS;
 
-            // Start player's turn
-            sem_post(&game_state->turn_sem[turn_index]);
+        int r = sem_timedwait(&game_state->turn_done_sem[turn_index], &ts);
 
-            // Wait until that player finishes their full turn
-            sem_wait(&game_state->done_sem[turn_index]);
+        pthread_mutex_lock(&game_state->game_mutex);
+        game_state->turn_active[turn_index] = 0; // slice ends no matter what
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        if (r == -1 && errno == ETIMEDOUT) {
+            printf("[SCHEDULER] Player %d quantum expired\n", turn_index + 1);
+            // optional: you can notify player through their FIFO if you store FDs (you don't)
+        } else {
+            printf("[SCHEDULER] Player %d finished early\n", turn_index + 1);
         }
+
+        turn_index = (turn_index + 1) % limit;
     }
 
-    printf("[SCHEDULER] Scheduler thread ending\n");
+    printf("[SCHEDULER] Scheduler ending\n");
     return NULL;
 }
 
