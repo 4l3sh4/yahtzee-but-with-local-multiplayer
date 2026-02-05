@@ -573,6 +573,13 @@ void handle_client(int player_id, const char* client_fifo) {
         pthread_mutex_unlock(&game_state->game_mutex);
         
         roll_dice(player_id);
+        snprintf(buffer, sizeof(buffer), "Your dice: [%d] [%d] [%d] [%d] [%d]\n",
+                game_state->player_dice[player_id][0],
+                game_state->player_dice[player_id][1],
+                game_state->player_dice[player_id][2],
+                game_state->player_dice[player_id][3],
+                game_state->player_dice[player_id][4]);
+        write(write_fd, buffer, strlen(buffer));
 
         /* --- SNAPSHOT FIRST ROLL POSSIBLE SCORES (FOR TIMEOUT AUTO-SCORE) --- */
         int first_possible[13];
@@ -585,39 +592,39 @@ void handle_client(int player_id, const char* client_fifo) {
         }
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        DO_FORCED_SCORE:
+    DO_FORCED_SCORE:
+        pthread_mutex_lock(&game_state->game_mutex);
+        int timed_out = game_state->turn_timed_out[player_id];
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        if (timed_out) {
+            int cat = -1;
+
             pthread_mutex_lock(&game_state->game_mutex);
-            int timed_out = game_state->turn_timed_out[player_id];
+            for (int c = 0; c < 13; c++) {
+                if (game_state->player_scores[player_id][c][1] == 0) {
+                    cat = c;
+                    break;
+                }
+            }
             pthread_mutex_unlock(&game_state->game_mutex);
 
-            if (timed_out) {
-                int cat = -1;
-
+            if (cat >= 0) {
                 pthread_mutex_lock(&game_state->game_mutex);
-                for (int c = 0; c < 13; c++) {
-                    if (game_state->player_scores[player_id][c][1] == 0) {
-                        cat = c;
-                        break;
-                    }
-                }
+                game_state->player_scores[player_id][cat][2] = first_possible[cat];
                 pthread_mutex_unlock(&game_state->game_mutex);
 
-                if (cat >= 0) {
-                    pthread_mutex_lock(&game_state->game_mutex);
-                    game_state->player_scores[player_id][cat][2] = first_possible[cat];
-                    pthread_mutex_unlock(&game_state->game_mutex);
+                apply_score(player_id, cat);
 
-                    apply_score(player_id, cat);
-
-                    snprintf(buffer, sizeof(buffer),
-                            "\n[TIME UP] Auto-scored FIRST roll in %s for %d points.\n",
-                            categories[cat], first_possible[cat]);
-                    write(write_fd, buffer, strlen(buffer));
-                }
-
-                sem_post(&game_state->turn_done_sem[player_id]);
-                continue;   // NEXT ROUND
+                snprintf(buffer, sizeof(buffer),
+                        "\n[TIME UP] Auto-scored FIRST roll in %s for %d points.\n",
+                        categories[cat], first_possible[cat]);
+                write(write_fd, buffer, strlen(buffer));
             }
+
+            sem_post(&game_state->turn_done_sem[player_id]);
+            continue;   // NEXT ROUND
+        }
 
         
         snprintf(buffer, sizeof(buffer), "Your dice: [%d] [%d] [%d] [%d] [%d]\n",
