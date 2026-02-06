@@ -169,10 +169,13 @@ static int apply_zero_next_available_nolock(int player_id) {
 }
 
 static void forfeit_turn_timeout(int player_id, int write_fd) {
+    // Try to post turn_done exactly once per turn:
+    // drain any existing token first (so we can't accumulate extra credits).
+    while (sem_trywait(&game_state->turn_done_sem[player_id]) == 0) {
+    }
+
     pthread_mutex_lock(&game_state->game_mutex);
-
     int cat = apply_zero_next_available_nolock(player_id);
-
     pthread_mutex_unlock(&game_state->game_mutex);
 
     if (cat >= 0) {
@@ -189,7 +192,6 @@ static void forfeit_turn_timeout(int player_id, int write_fd) {
         write(write_fd, msg, strlen(msg));
     }
 
-    // IMPORTANT: tell the scheduler we're done
     sem_post(&game_state->turn_done_sem[player_id]);
 }
 
