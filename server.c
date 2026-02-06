@@ -728,7 +728,8 @@ void handle_client(int player_id, const char* client_fifo) {
                 }
 
                 // Forced upper section / lower-only flow applies when Yahtzee box is already filled
-                if (game_state->player_scores[player_id][11][1] == 1) {
+                if (game_state->player_scores[player_id][11][1] == 1 &&
+                    game_state->yahtzee_achieved[player_id] == 'Y') {
                     int req = game_state->required_upper_section[player_id]; // 0..5
                     if (req >= 0 && req < 6 && game_state->player_scores[player_id][req][1] == 0) {
                         // Auto-score required upper section
@@ -923,17 +924,13 @@ void* scheduler_thread(void* arg) {
 
         // find next connected player
         int start = turn_index;
-        while (limit > 0 && !game_state->player_connected[turn_index]) {
-            turn_index = (turn_index + 1) % limit;
+        while (!game_state->player_connected[turn_index]) {
+            turn_index = (turn_index + 1) % MAX_PLAYERS;
             if (turn_index == start) break;
         }
-
         if (!game_state->player_connected[turn_index]) {
             pthread_mutex_unlock(&game_state->game_mutex);
-            struct timespec nap;
-            nap.tv_sec = 0;
-            nap.tv_nsec = 100000000; // 100ms
-            nanosleep(&nap, NULL);
+            nanosleep(&(struct timespec){0, 100000000}, NULL);
             continue;
         }
 
@@ -946,9 +943,10 @@ void* scheduler_thread(void* arg) {
 
         struct timespec now;
         clock_gettime(CLOCK_REALTIME, &now);
+        pthread_mutex_lock(&game_state->game_mutex);
         game_state->turn_deadline[turn_index] = now;
         game_state->turn_deadline[turn_index].tv_sec += QUANTUM_SECONDS;
-
+        pthread_mutex_unlock(&game_state->game_mutex);
         // give turn
         sem_post(&game_state->turn_sem[turn_index]);
 
@@ -970,7 +968,7 @@ void* scheduler_thread(void* arg) {
             printf("[SCHEDULER] Player %d completed their turn.\n", turn_index + 1);
         }
 
-        turn_index = (turn_index + 1) % limit;
+        turn_index = (turn_index + 1) % MAX_PLAYERS;
     }
 
     printf("[SCHEDULER] Scheduler ending\n");
