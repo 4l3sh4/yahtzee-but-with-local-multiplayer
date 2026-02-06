@@ -30,11 +30,20 @@
 typedef struct {
     int current_turn;
     int active_players;
-    int target_players;      
-    int host_player_id;      
+    int target_players;
+    int host_player_id;
     int game_started;
     int game_round;
     int game_finished;
+
+    // NEW: Freeze who participates in the match at game start
+    int participants[MAX_PLAYERS];      // 1 if this player is in THIS match
+    int participants_count;             // should == target_players at start
+
+    // NEW: endgame bookkeeping
+    int player_done[MAX_PLAYERS];       // 1 if filled 13 categories (or forfeited)
+    int final_scores[MAX_PLAYERS];
+    int winner_id;
 
     char player_names[MAX_PLAYERS][NAME_SIZE];
     int  player_connected[MAX_PLAYERS];
@@ -44,15 +53,15 @@ typedef struct {
 
     int  player_scores[MAX_PLAYERS][15][3];
 
-    char yahtzee_achieved[MAX_PLAYERS];      
-    int  amount_yahtzee[MAX_PLAYERS];         
-    int  required_upper_section[MAX_PLAYERS];  
-    char lower_section_only[MAX_PLAYERS];     
-    char skip_scoring[MAX_PLAYERS];            
-    char bonus_achieved[MAX_PLAYERS];          
-    char upper_section_filled[MAX_PLAYERS];    
+    char yahtzee_achieved[MAX_PLAYERS];
+    int  amount_yahtzee[MAX_PLAYERS];
+    int  required_upper_section[MAX_PLAYERS];
+    char lower_section_only[MAX_PLAYERS];
+    char skip_scoring[MAX_PLAYERS];
+    char bonus_achieved[MAX_PLAYERS];
+    char upper_section_filled[MAX_PLAYERS];
     char lower_section_filled[MAX_PLAYERS];
-    
+
     struct timespec turn_deadline[MAX_PLAYERS];
 
     pthread_mutex_t game_mutex;
@@ -65,10 +74,11 @@ typedef struct {
 } GameState;
 
 GameState *game_state;
+
 static void update_section_flags_nolock(int player_id);
 static int  maybe_award_upper_bonus_nolock(int player_id);
 
-// HELPER FUNCTIONS [ALESHA]
+// ------------------------------ Helpers ------------------------------
 
 int compare_int(const void *a, const void *b) {
     return (*(int*)a - *(int*)b);
@@ -129,7 +139,7 @@ static int ms_until_deadline(const struct timespec *deadline) {
 
     long ms = sec * 1000L + nsec / 1000000L;
     if (ms < 0) ms = 0;
-    if (ms > 2147483000L) ms = 2147483000L; // clamp to int range
+    if (ms > 2147483000L) ms = 2147483000L;
     return (int)ms;
 }
 
@@ -147,13 +157,95 @@ static int timed_read_line(int fd, char *buf, size_t sz, const struct timespec *
     pfd.events = POLLIN;
 
     int pr = poll(&pfd, 1, timeout_ms);
-    if (pr == 0) return -2;       // timeout
-    if (pr < 0) return -1;        // error
+    if (pr == 0) return -2;
+    if (pr < 0) return -1;
 
     int n = (int)read(fd, buf, sz - 1);
     if (n > 0) buf[n] = '\0';
     return n;
 }
+
+// ------------------------------ Endgame logic (NEW) ------------------------------
+
+static int player_finished_nolock(int pid) {
+    int scored = 0;
+    for (int c = 0; c < 13; c++) {
+        if (game_state->player_scores[pid][c][1] == 1) scored++;
+    }
+    return (scored == 13);
+}
+
+static void wake_all_players_nolock(void) {
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        if (game_state->participants[p]) {
+            sem_post(&game_state->turn_sem[p]); // release any sem_wait stuck clients
+        }
+    }
+}
+
+static void finalize_game_nolock(void) {
+    if (game_state->game_finished) return;
+
+    int best = -1;
+    int best_score = -1;
+
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        if (!game_state->participants[p]) continue;
+
+        // Ensure bonus is correct before totaling
+        maybe_award_upper_bonus_nolock(p);
+
+        int total = 0;
+        for (int i = 0; i < 15; i++) total += game_state->player_scores[p][i][0];
+
+        game_state->final_scores[p] = total;
+
+        if (total > best_score) { best_score = total; best = p; }
+    }
+
+    game_state->winner_id = best;
+    game_state->game_finished = 1;
+
+    if (best >= 0) game_state->total_wins[best] += 1;
+
+    wake_all_players_nolock();
+}
+
+static void maybe_end_game_nolock(void) {
+    if (!game_state->game_started) return;
+    int need = game_state->participants_count;
+    if (need <= 0) return;
+
+    int done = 0;
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        if (!game_state->participants[p]) continue;
+
+        if (player_finished_nolock(p)) game_state->player_done[p] = 1;
+        if (game_state->player_done[p]) done++;
+    }
+
+    if (done == need) finalize_game_nolock();
+}
+
+// Auto-forfeit remaining categories on disconnect (NEW safety)
+static void forfeit_remaining_on_disconnect_nolock(int player_id) {
+    if (!game_state->participants[player_id]) return;
+    if (game_state->player_done[player_id]) return;
+
+    for (int cat = 0; cat < 13; cat++) {
+        if (game_state->player_scores[player_id][cat][1] == 0) {
+            game_state->player_scores[player_id][cat][0] = 0;
+            game_state->player_scores[player_id][cat][1] = 1;
+        }
+    }
+    update_section_flags_nolock(player_id);
+    maybe_award_upper_bonus_nolock(player_id);
+
+    game_state->player_done[player_id] = 1;
+    maybe_end_game_nolock();
+}
+
+// ------------------------------ Timeout scoring ------------------------------
 
 static int apply_zero_next_available_nolock(int player_id) {
     for (int cat = 0; cat < 13; cat++) {
@@ -162,15 +254,15 @@ static int apply_zero_next_available_nolock(int player_id) {
             game_state->player_scores[player_id][cat][1] = 1;
             update_section_flags_nolock(player_id);
             maybe_award_upper_bonus_nolock(player_id);
+            // NEW: after applying a score, check end condition
+            maybe_end_game_nolock();
             return cat;
         }
     }
-    return -1; // nothing left
+    return -1;
 }
 
 static void forfeit_turn_timeout(int player_id, int write_fd) {
-    // Try to post turn_done exactly once per turn:
-    // drain any existing token first (so we can't accumulate extra credits).
     while (sem_trywait(&game_state->turn_done_sem[player_id]) == 0) {
     }
 
@@ -195,7 +287,7 @@ static void forfeit_turn_timeout(int player_id, int write_fd) {
     sem_post(&game_state->turn_done_sem[player_id]);
 }
 
-// GAME LOGIC [ALESHA]
+// ------------------------------ Game logic ------------------------------
 
 void roll_dice(int player_id) {
     pthread_mutex_lock(&game_state->game_mutex);
@@ -225,10 +317,8 @@ void calculate_possible_scores(int player_id) {
     for (int i = 0; i < 5; i++) dice[i] = game_state->player_dice[player_id][i];
     qsort(dice, 5, sizeof(int), compare_int);
 
-    // reset possible scores
     for (int i = 0; i < 15; i++) game_state->player_scores[player_id][i][2] = 0;
 
-    // Upper section
     for (int i = 0; i < 5; i++) {
         if (dice[i] == 1) game_state->player_scores[player_id][0][2] += 1;
         if (dice[i] == 2) game_state->player_scores[player_id][1][2] += 2;
@@ -238,42 +328,36 @@ void calculate_possible_scores(int player_id) {
         if (dice[i] == 6) game_state->player_scores[player_id][5][2] += 6;
     }
 
-    // Three of a kind
     if (has_n_of_a_kind(dice, 3)) {
         int sum = 0;
         for (int i = 0; i < 5; i++) sum += dice[i];
         game_state->player_scores[player_id][6][2] = sum;
     }
 
-    // Four of a kind
     if (has_n_of_a_kind(dice, 4)) {
         int sum = 0;
         for (int i = 0; i < 5; i++) sum += dice[i];
         game_state->player_scores[player_id][7][2] = sum;
     }
 
-    // Full house / straights / yahtzee
     if (is_full_house(dice)) game_state->player_scores[player_id][8][2] = 25;
     if (has_small_straight(dice)) game_state->player_scores[player_id][9][2] = 30;
     if (has_large_straight(dice)) game_state->player_scores[player_id][10][2] = 40;
 
     if (has_n_of_a_kind(dice, 5)) {
         game_state->player_scores[player_id][11][2] = 50;
-        // required upper section for forced-scoring rule
         game_state->required_upper_section[player_id] = dice[0] - 1; // 0..5
     }
 
-    // Chance
     int sum = 0;
     for (int i = 0; i < 5; i++) sum += dice[i];
     game_state->player_scores[player_id][12][2] = sum;
 
-    // Joker rules: if yahtzee achieved earlier AND current roll is yahtzee, allow fixed lower scores
     if (game_state->yahtzee_achieved[player_id] == 'Y' &&
         game_state->player_scores[player_id][11][2] == 50) {
-        game_state->player_scores[player_id][8][2]  = 25; // full house
-        game_state->player_scores[player_id][9][2]  = 30; // small straight
-        game_state->player_scores[player_id][10][2] = 40; // large straight
+        game_state->player_scores[player_id][8][2]  = 25;
+        game_state->player_scores[player_id][9][2]  = 30;
+        game_state->player_scores[player_id][10][2] = 40;
     }
 
     pthread_mutex_unlock(&game_state->game_mutex);
@@ -315,13 +399,15 @@ int apply_score(int player_id, int category) {
     game_state->player_scores[player_id][category][0] = game_state->player_scores[player_id][category][2];
     game_state->player_scores[player_id][category][1] = 1;
 
-    // Track Yahtzee achieved
     if (category == 11 && game_state->player_scores[player_id][category][0] == 50) {
         game_state->yahtzee_achieved[player_id] = 'Y';
     }
 
     update_section_flags_nolock(player_id);
     maybe_award_upper_bonus_nolock(player_id);
+
+    // NEW: check endgame right after scoring
+    maybe_end_game_nolock();
 
     pthread_mutex_unlock(&game_state->game_mutex);
     return 1;
@@ -331,22 +417,16 @@ int calculate_total_score(int player_id) {
     int total = 0;
 
     pthread_mutex_lock(&game_state->game_mutex);
-
-    // ensure upper bonus awarded if eligible
     maybe_award_upper_bonus_nolock(player_id);
-
-    for (int i = 0; i < 15; i++) {
-        total += game_state->player_scores[player_id][i][0];
-    }
-
+    for (int i = 0; i < 15; i++) total += game_state->player_scores[player_id][i][0];
     pthread_mutex_unlock(&game_state->game_mutex);
+
     return total;
 }
 
-// SHARED MEMORY INITIALIZATION [ARIANA]
+// ------------------------------ Shared Memory Init ------------------------------
 
 int init_shared_memory() {
-    // Always start with a clean shared memory region to prevent stale game_started/target values
     shm_unlink("/yahtzee_shm");
 
     int shm_fd = shm_open("/yahtzee_shm", O_CREAT | O_RDWR, 0666);
@@ -371,7 +451,6 @@ int init_shared_memory() {
 
     memset(game_state, 0, sizeof(GameState));
 
-    // init mutexes as process-shared
     pthread_mutexattr_t mutex_attr;
     pthread_mutexattr_init(&mutex_attr);
     pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
@@ -381,23 +460,30 @@ int init_shared_memory() {
 
     pthread_mutexattr_destroy(&mutex_attr);
 
-    // init semaphores as process-shared
     for (int i = 0; i < MAX_PLAYERS; i++) {
         sem_init(&game_state->turn_sem[i], 1, 0);
         sem_init(&game_state->turn_done_sem[i], 1, 0);
         game_state->turn_active[i] = 0;
         game_state->turn_deadline[i].tv_sec = 0;
         game_state->turn_deadline[i].tv_nsec = 0;
-
     }
 
     game_state->current_turn   = 0;
     game_state->active_players = 0;
-    game_state->target_players = 0;   
+    game_state->target_players = 0;
     game_state->host_player_id = -1;
     game_state->game_started   = 0;
     game_state->game_round     = 1;
     game_state->game_finished  = 0;
+
+    // NEW init
+    game_state->participants_count = 0;
+    game_state->winner_id = -1;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        game_state->participants[i] = 0;
+        game_state->player_done[i] = 0;
+        game_state->final_scores[i] = 0;
+    }
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
         game_state->player_connected[i] = 0;
@@ -425,8 +511,7 @@ int init_shared_memory() {
     return 0;
 }
 
-
-// ZOMBIE REAPING (SIGCHLD) [ARIANA]
+// ------------------------------ SIGCHLD ------------------------------
 
 void sigchld_handler(int sig) {
     (void)sig;
@@ -450,8 +535,7 @@ void setup_signal_handlers() {
     printf("✓ Signal handlers set up\n");
 }
 
-
-// IPC SETUP (Named Pipes) [ARIANA]
+// ------------------------------ IPC ------------------------------
 
 int setup_ipc_server() {
     struct stat st = {0};
@@ -461,24 +545,23 @@ int setup_ipc_server() {
             return -1;
         }
     }
-    
+
     unlink(SERVER_FIFO);
     if (mkfifo(SERVER_FIFO, 0666) == -1) {
         perror("mkfifo failed");
         return -1;
     }
-    
+
     printf("✓ IPC setup complete (Named Pipes)\n");
     return 0;
 }
 
-// open both ends once if we neeed to reject a client after receiving its FIFO path
 static void reject_client(const char* client_fifo, const char* msg) {
     char client_read_fifo[256];
     snprintf(client_read_fifo, sizeof(client_read_fifo), "%s_read", client_fifo);
 
-    int wfd = open(client_fifo, O_WRONLY);           // blocks until client opens read end
-    int rfd = open(client_read_fifo, O_RDONLY);      // blocks until client opens write end
+    int wfd = open(client_fifo, O_WRONLY);
+    int rfd = open(client_read_fifo, O_RDONLY);
 
     if (wfd >= 0) {
         write(wfd, msg, strlen(msg));
@@ -487,29 +570,26 @@ static void reject_client(const char* client_fifo, const char* msg) {
     if (rfd >= 0) close(rfd);
 }
 
-
-
-// CLIENT HANDLER (Child Process) [ARIANA]
+// ------------------------------ Client Handler ------------------------------
 
 void handle_client(int player_id, const char* client_fifo) {
     char buffer[BUFFER_SIZE];
     char recv_buffer[256];
     char client_read_fifo[256];
-    
+
     snprintf(client_read_fifo, sizeof(client_read_fifo), "%s_read", client_fifo);
-    
+
     int write_fd = open(client_fifo, O_WRONLY);
-    int read_fd = open(client_read_fifo, O_RDONLY);
-    
+    int read_fd  = open(client_read_fifo, O_RDONLY);
+
     if (write_fd < 0 || read_fd < 0) {
         perror("open FIFOs failed");
         exit(1);
     }
-    
-    // Get player name
+
     snprintf(buffer, sizeof(buffer), "Enter your name: ");
     write(write_fd, buffer, strlen(buffer));
-    
+
     int n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
     if (n > 0) {
         recv_buffer[n] = '\0';
@@ -518,21 +598,17 @@ void handle_client(int player_id, const char* client_fifo) {
         strncpy(game_state->player_names[player_id], recv_buffer, NAME_SIZE - 1);
         pthread_mutex_unlock(&game_state->game_mutex);
     }
-    
+
     snprintf(buffer, sizeof(buffer), "Welcome %s! You are Player %d\n",
              game_state->player_names[player_id], player_id + 1);
     write(write_fd, buffer, strlen(buffer));
 
-    // First connected player becomes the host and chooses the target player count
     pthread_mutex_lock(&game_state->game_mutex);
-    if (game_state->host_player_id < 0) {
-        game_state->host_player_id = player_id;
-    }
+    if (game_state->host_player_id < 0) game_state->host_player_id = player_id;
     int host_id = game_state->host_player_id;
     pthread_mutex_unlock(&game_state->game_mutex);
 
     if (player_id == host_id) {
-        // Host chooses player count once
         while (1) {
             pthread_mutex_lock(&game_state->game_mutex);
             int target = game_state->target_players;
@@ -548,7 +624,6 @@ void handle_client(int player_id, const char* client_fifo) {
 
             n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
             if (n <= 0) {
-                // client disconnected
                 close(write_fd);
                 close(read_fd);
                 exit(0);
@@ -575,7 +650,6 @@ void handle_client(int player_id, const char* client_fifo) {
             }
         }
     } else {
-        // Non-host players wait until host chooses the target count
         snprintf(buffer, sizeof(buffer),
                  "Waiting for host to choose number of players...\n");
         write(write_fd, buffer, strlen(buffer));
@@ -599,8 +673,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
     snprintf(buffer, sizeof(buffer), "Waiting for game to start...\n");
     write(write_fd, buffer, strlen(buffer));
-    
-    // Wait until server starts the game (protected by mutex so all processes see updates)
+
     while (1) {
         pthread_mutex_lock(&game_state->game_mutex);
         int started = game_state->game_started;
@@ -609,39 +682,53 @@ void handle_client(int player_id, const char* client_fifo) {
         if (started) break;
         sleep(1);
     }
-    
+
+    // If this player isn't a participant (shouldn't happen), exit.
+    pthread_mutex_lock(&game_state->game_mutex);
+    int am_participant = game_state->participants[player_id];
+    pthread_mutex_unlock(&game_state->game_mutex);
+    if (!am_participant) {
+        write(write_fd, "Server: You are not a participant in this match.\n", 51);
+        close(write_fd);
+        close(read_fd);
+        exit(0);
+    }
+
     snprintf(buffer, sizeof(buffer), "\n*** GAME STARTING! ***\n\n");
     write(write_fd, buffer, strlen(buffer));
-    
-    // Game loop
+
     const char *categories[] = {
         "Aces", "Twos", "Threes", "Fours", "Fives", "Sixes",
         "Three of a Kind", "Four of a Kind", "Full House",
         "Small Straight", "Large Straight", "Yahtzee", "Chance"
     };
-    
-    for (int round = 1; round <= MAX_ROUNDS && !game_state->game_finished; round++) {
+
+    // NEW: real loop (not fake round counter)
+    while (1) {
         sem_wait(&game_state->turn_sem[player_id]);
-        struct timespec deadline;
+
         pthread_mutex_lock(&game_state->game_mutex);
-        deadline = game_state->turn_deadline[player_id];
+        int finished = game_state->game_finished;
+        int my_done  = game_state->player_done[player_id];
+        struct timespec deadline = game_state->turn_deadline[player_id];
         pthread_mutex_unlock(&game_state->game_mutex);
-        
+
+        if (finished || my_done) break;
         if (!game_state->player_connected[player_id]) break;
-        
+
         snprintf(buffer, sizeof(buffer),
                  "\n========================================\n"
-                 "[ROUND %d - YOUR TURN, %s]\n"
+                 "[YOUR TURN, %s]\n"
                  "========================================\n",
-                 round, game_state->player_names[player_id]);
+                 game_state->player_names[player_id]);
         write(write_fd, buffer, strlen(buffer));
-        
+
         pthread_mutex_lock(&game_state->game_mutex);
         game_state->player_rerolls_left[player_id] = 2;
         pthread_mutex_unlock(&game_state->game_mutex);
-        
+
         roll_dice(player_id);
-        
+
         snprintf(buffer, sizeof(buffer), "Your dice: [%d] [%d] [%d] [%d] [%d]\n",
                  game_state->player_dice[player_id][0],
                  game_state->player_dice[player_id][1],
@@ -649,44 +736,42 @@ void handle_client(int player_id, const char* client_fifo) {
                  game_state->player_dice[player_id][3],
                  game_state->player_dice[player_id][4]);
         write(write_fd, buffer, strlen(buffer));
-        
-        // Reroll [ALESHA]
+
+        // Reroll
         while (game_state->player_rerolls_left[player_id] > 0) {
             snprintf(buffer, sizeof(buffer), "\nRerolls left: %d. Reroll? (Y/N): ",
                      game_state->player_rerolls_left[player_id]);
             write(write_fd, buffer, strlen(buffer));
-            
+
             n = timed_read_line(read_fd, recv_buffer, sizeof(recv_buffer), &deadline);
             if (n == -2) { forfeit_turn_timeout(player_id, write_fd); goto next_turn; }
             if (n <= 0) break;
-            
+
             if (recv_buffer[0] == 'N' || recv_buffer[0] == 'n') break;
-            
+
             if (recv_buffer[0] == 'Y' || recv_buffer[0] == 'y') {
                 snprintf(buffer, sizeof(buffer), "Which dice? (e.g., 1 3 5): ");
                 write(write_fd, buffer, strlen(buffer));
-                
+
                 n = timed_read_line(read_fd, recv_buffer, sizeof(recv_buffer), &deadline);
                 if (n == -2) { forfeit_turn_timeout(player_id, write_fd); goto next_turn; }
                 if (n <= 0) break;
-                
+
                 int dice_to_reroll[5];
                 int count = 0;
                 char *token = strtok(recv_buffer, " \n");
                 while (token && count < 5) {
                     int die = atoi(token);
-                    if (die >= 1 && die <= 5) {
-                        dice_to_reroll[count++] = die;
-                    }
+                    if (die >= 1 && die <= 5) dice_to_reroll[count++] = die;
                     token = strtok(NULL, " \n");
                 }
-                
+
                 if (count > 0) {
                     reroll_dice(player_id, dice_to_reroll, count);
                     pthread_mutex_lock(&game_state->game_mutex);
                     game_state->player_rerolls_left[player_id]--;
                     pthread_mutex_unlock(&game_state->game_mutex);
-                    
+
                     snprintf(buffer, sizeof(buffer), "New dice: [%d] [%d] [%d] [%d] [%d]\n",
                              game_state->player_dice[player_id][0],
                              game_state->player_dice[player_id][1],
@@ -697,10 +782,10 @@ void handle_client(int player_id, const char* client_fifo) {
                 }
             }
         }
-        
+
         calculate_possible_scores(player_id);
 
-        // Yahtzee extra/Joker/forced rules [ALESHA]
+        // Yahtzee extra/Joker/forced rules
         pthread_mutex_lock(&game_state->game_mutex);
 
         game_state->skip_scoring[player_id] = 'N';
@@ -709,16 +794,13 @@ void handle_client(int player_id, const char* client_fifo) {
         int rolled_yahtzee = (game_state->player_scores[player_id][11][2] == 50);
 
         if (rolled_yahtzee) {
-            // required upper section already set by calculate_possible_scores()
             if (game_state->amount_yahtzee[player_id] >= 1) {
-                // additional Yahtzee
                 snprintf(buffer, sizeof(buffer),
                          "\n\nCongratulations! You scored another Yahtzee!\n");
                 write(write_fd, buffer, strlen(buffer));
 
                 game_state->amount_yahtzee[player_id] += 1;
 
-                // Yahtzee bonus (+100) only if Yahtzee box has been achieved earlier
                 if (game_state->yahtzee_achieved[player_id] == 'Y') {
                     game_state->player_scores[player_id][14][0] += 100;
                     game_state->player_scores[player_id][14][1] = 1;
@@ -727,9 +809,9 @@ void handle_client(int player_id, const char* client_fifo) {
                     write(write_fd, buffer, strlen(buffer));
                 }
 
-                // Forced upper section / lower-only flow applies when Yahtzee box is already filled
                 if (game_state->player_scores[player_id][11][1] == 1 &&
                     game_state->yahtzee_achieved[player_id] == 'Y') {
+
                     int req = game_state->required_upper_section[player_id]; // 0..5
                     if (req >= 0 && req < 6 && game_state->player_scores[player_id][req][1] == 0) {
                         // Auto-score required upper section
@@ -744,6 +826,12 @@ void handle_client(int player_id, const char* client_fifo) {
                         write(write_fd, buffer, strlen(buffer));
 
                         game_state->skip_scoring[player_id] = 'Y';
+
+                        // NEW: end-check after auto-fill
+                        update_section_flags_nolock(player_id);
+                        maybe_award_upper_bonus_nolock(player_id);
+                        maybe_end_game_nolock();
+
                     } else if (req >= 0 && req < 6 &&
                                game_state->player_scores[player_id][req][1] == 1 &&
                                game_state->lower_section_filled[player_id] == 'N') {
@@ -756,7 +844,6 @@ void handle_client(int player_id, const char* client_fifo) {
                     }
                 }
             } else {
-                // first Yahtzee roll
                 snprintf(buffer, sizeof(buffer),
                          "\n\nCongratulations! You scored a Yahtzee!\n");
                 write(write_fd, buffer, strlen(buffer));
@@ -764,13 +851,12 @@ void handle_client(int player_id, const char* client_fifo) {
             }
         }
 
-        // Update section flags + bonus eligibility based on any auto-fill
         update_section_flags_nolock(player_id);
         maybe_award_upper_bonus_nolock(player_id);
 
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        // Scoring selection (skip if server auto-scored required upper box) 
+        // Scoring selection (skip if server auto-scored required upper box)
         if (game_state->skip_scoring[player_id] == 'N') {
             snprintf(buffer, sizeof(buffer), "\n=== SCORING OPTIONS ===\n");
             write(write_fd, buffer, strlen(buffer));
@@ -795,7 +881,7 @@ void handle_client(int player_id, const char* client_fifo) {
                 }
             }
 
-            int valid = 0, choice;
+            int valid = 0, choice = -1;
             while (!valid) {
                 if (game_state->lower_section_only[player_id] == 'N') {
                     snprintf(buffer, sizeof(buffer), "\nChoose category (1-13): ");
@@ -830,6 +916,12 @@ void handle_client(int player_id, const char* client_fifo) {
             }
         }
 
+        // If player just finished, mark done (redundant but safe)
+        pthread_mutex_lock(&game_state->game_mutex);
+        if (player_finished_nolock(player_id)) game_state->player_done[player_id] = 1;
+        maybe_end_game_nolock();
+        pthread_mutex_unlock(&game_state->game_mutex);
+
         // Show current scorecard
         pthread_mutex_lock(&game_state->game_mutex);
 
@@ -851,7 +943,6 @@ void handle_client(int player_id, const char* client_fifo) {
             write(write_fd, buffer, strlen(buffer));
         }
 
-        // Bonus progress info
         int upper_total = 0;
         for (int i = 0; i < 6; i++) upper_total += game_state->player_scores[player_id][i][0];
 
@@ -877,36 +968,67 @@ void handle_client(int player_id, const char* client_fifo) {
 
         snprintf(buffer, sizeof(buffer), "Turn complete. Waiting for other players...\n");
         write(write_fd, buffer, strlen(buffer));
+
         sem_post(&game_state->turn_done_sem[player_id]);
-        next_turn:
-            ;
-    }   
-    
-    if (game_state->game_finished) {
-        int final_score = calculate_total_score(player_id);
-        snprintf(buffer, sizeof(buffer),
-                 "\n=== GAME OVER ===\nYour final score: %d\n", final_score);
-        write(write_fd, buffer, strlen(buffer));
+
+    next_turn:
+        ;
     }
-    
+
+    // GAME OVER output (winner + table)
     pthread_mutex_lock(&game_state->game_mutex);
+    int winner = game_state->winner_id;
+    int my_final = game_state->final_scores[player_id];
+    int finished = game_state->game_finished;
+    pthread_mutex_unlock(&game_state->game_mutex);
+
+    if (finished) {
+        pthread_mutex_lock(&game_state->game_mutex);
+        snprintf(buffer, sizeof(buffer),
+                 "\n=== GAME OVER ===\nYour final score: %d\n",
+                 my_final);
+        write(write_fd, buffer, strlen(buffer));
+
+        if (winner >= 0) {
+            snprintf(buffer, sizeof(buffer),
+                     "Winner: %s (Player %d) with %d\n",
+                     game_state->player_names[winner], winner + 1,
+                     game_state->final_scores[winner]);
+            write(write_fd, buffer, strlen(buffer));
+        } else {
+            write(write_fd, "Winner: N/A\n", 12);
+        }
+
+        write(write_fd, "\nFinal Scores:\n", 14);
+        for (int p = 0; p < MAX_PLAYERS; p++) {
+            if (!game_state->participants[p]) continue;
+            snprintf(buffer, sizeof(buffer), "Player %d (%s): %d\n",
+                     p + 1, game_state->player_names[p], game_state->final_scores[p]);
+            write(write_fd, buffer, strlen(buffer));
+        }
+        pthread_mutex_unlock(&game_state->game_mutex);
+    }
+
+    // Disconnect handling: if a participant disconnects early, auto-forfeit remaining (prevents deadlock)
+    pthread_mutex_lock(&game_state->game_mutex);
+    forfeit_remaining_on_disconnect_nolock(player_id);
+
     game_state->player_connected[player_id] = 0;
     game_state->active_players--;
     pthread_mutex_unlock(&game_state->game_mutex);
-    
+
     snprintf(buffer, sizeof(buffer), "Disconnecting...\n");
     write(write_fd, buffer, strlen(buffer));
-    
+
     close(write_fd);
     close(read_fd);
-    
+
     printf("[SYSTEM] Player %d (%s) disconnected\n",
            player_id + 1, game_state->player_names[player_id]);
+    exit(0);
 }
 
-
-// ROUND ROBIN SCHEDULER [AMIRAH]
-// The current scheduler is the simplified one used to test synchronization
+// ------------------------------ Scheduler ------------------------------
 
 void* scheduler_thread(void* arg) {
     (void)arg;
@@ -914,32 +1036,35 @@ void* scheduler_thread(void* arg) {
 
     int turn_index = 0;
 
-    while (!game_state->game_finished) {
+    while (1) {
         pthread_mutex_lock(&game_state->game_mutex);
 
-        int limit = (game_state->target_players > 0)
-                      ? game_state->target_players
-                      : game_state->active_players;
-        if (limit <= 0) limit = MAX_PLAYERS;
+        if (game_state->game_finished) {
+            pthread_mutex_unlock(&game_state->game_mutex);
+            break;
+        }
 
-        // find next connected player
+        // Find next participant who isn't done
         int start = turn_index;
-        while (!game_state->player_connected[turn_index]) {
+        while (!game_state->participants[turn_index] || game_state->player_done[turn_index]) {
             turn_index = (turn_index + 1) % MAX_PLAYERS;
             if (turn_index == start) break;
         }
-        if (!game_state->player_connected[turn_index]) {
+
+        if (!game_state->participants[turn_index] || game_state->player_done[turn_index]) {
+            // Nobody schedulable; either finished or broken state
+            maybe_end_game_nolock();
             pthread_mutex_unlock(&game_state->game_mutex);
             nanosleep(&(struct timespec){0, 100000000}, NULL);
             continue;
         }
 
         game_state->current_turn = turn_index;
-        game_state->turn_active[turn_index] = 1;  // time slice starts
+        game_state->turn_active[turn_index] = 1;
         pthread_mutex_unlock(&game_state->game_mutex);
 
         printf("[SCHEDULER] Turn -> Player %d (%ds quantum)\n",
-        turn_index + 1, QUANTUM_SECONDS);
+               turn_index + 1, QUANTUM_SECONDS);
 
         struct timespec now;
         clock_gettime(CLOCK_REALTIME, &now);
@@ -947,10 +1072,9 @@ void* scheduler_thread(void* arg) {
         game_state->turn_deadline[turn_index] = now;
         game_state->turn_deadline[turn_index].tv_sec += QUANTUM_SECONDS;
         pthread_mutex_unlock(&game_state->game_mutex);
-        // give turn
+
         sem_post(&game_state->turn_sem[turn_index]);
 
-        // wait for done or timeout
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += QUANTUM_SECONDS;
@@ -958,15 +1082,19 @@ void* scheduler_thread(void* arg) {
         int r = sem_timedwait(&game_state->turn_done_sem[turn_index], &ts);
 
         pthread_mutex_lock(&game_state->game_mutex);
-        game_state->turn_active[turn_index] = 0; // slice ends no matter what
+        game_state->turn_active[turn_index] = 0;
         pthread_mutex_unlock(&game_state->game_mutex);
 
         if (r == -1 && errno == ETIMEDOUT) {
             printf("[SCHEDULER] Player %d quantum expired\n", turn_index + 1);
-            // optional: you can notify player through their FIFO if you store FDs (you don't)
         } else {
             printf("[SCHEDULER] Player %d completed their turn.\n", turn_index + 1);
         }
+
+        // After each slice, re-check endgame
+        pthread_mutex_lock(&game_state->game_mutex);
+        maybe_end_game_nolock();
+        pthread_mutex_unlock(&game_state->game_mutex);
 
         turn_index = (turn_index + 1) % MAX_PLAYERS;
     }
@@ -975,10 +1103,10 @@ void* scheduler_thread(void* arg) {
     return NULL;
 }
 
-// MAIN FUNCTION [ARIANA]
+// ------------------------------ Main ------------------------------
 
 int main() {
-    srand(time(NULL));
+    srand((unsigned)time(NULL));
 
     printf("\n");
     printf("╔════════════════════════════════════════════╗\n");
@@ -1006,32 +1134,24 @@ int main() {
     pthread_t scheduler_tid;
     int scheduler_created = 0;
 
-    // Keep the server FIFO open (RDWR prevents EOF when no writers)
     int server_fd = open(SERVER_FIFO, O_RDWR | O_NONBLOCK);
     if (server_fd < 0) {
         perror("open server FIFO");
         return 1;
     }
 
-    // Small line buffer for FIFO messages (client fifo path per line)
     char accum[2048];
     size_t accum_len = 0;
 
     while (1) {
-        // Read connection requests (non-blocking)
         char buf[256];
-        int n = read(server_fd, buf, sizeof(buf));
+        int n = (int)read(server_fd, buf, sizeof(buf));
         if (n > 0) {
-            // append to accumulator
             size_t to_copy = (size_t)n;
-            if (accum_len + to_copy >= sizeof(accum)) {
-                // reset if overflow
-                accum_len = 0;
-            }
+            if (accum_len + to_copy >= sizeof(accum)) accum_len = 0;
             memcpy(accum + accum_len, buf, to_copy);
             accum_len += to_copy;
 
-            // process complete lines
             size_t start = 0;
             for (size_t i = 0; i < accum_len; i++) {
                 if (accum[i] == '\n') {
@@ -1040,11 +1160,8 @@ int main() {
                     if (line_len >= sizeof(client_fifo)) line_len = sizeof(client_fifo) - 1;
                     memcpy(client_fifo, accum + start, line_len);
                     client_fifo[line_len] = '\0';
-
-                    // advance start past newline
                     start = i + 1;
 
-                    // ignore empty lines
                     if (client_fifo[0] == '\0') continue;
 
                     pthread_mutex_lock(&game_state->game_mutex);
@@ -1102,7 +1219,6 @@ int main() {
                 }
             }
 
-            // compact accumulator (remove processed bytes)
             if (start > 0) {
                 memmove(accum, accum + start, accum_len - start);
                 accum_len -= start;
@@ -1117,6 +1233,20 @@ int main() {
         int connected = game_state->active_players;
 
         if (!scheduler_created && !game_state->game_started && target > 0 && connected >= target) {
+            // NEW: freeze participants NOW
+            game_state->participants_count = 0;
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                if (game_state->player_connected[p] && game_state->participants_count < target) {
+                    game_state->participants[p] = 1;
+                    game_state->participants_count++;
+                } else {
+                    game_state->participants[p] = 0;
+                }
+                game_state->player_done[p] = 0;
+                game_state->final_scores[p] = 0;
+            }
+            game_state->winner_id = -1;
+
             game_state->game_started = 1;
             pthread_mutex_unlock(&game_state->game_mutex);
 
@@ -1128,12 +1258,10 @@ int main() {
             pthread_mutex_unlock(&game_state->game_mutex);
         }
 
-        // small sleep to avoid busy loop
-        struct timespec ts = {0, 100000000}; // 100ms
+        struct timespec ts = {0, 100000000};
         nanosleep(&ts, NULL);
     }
 
-    // not reached in normal run
     close(server_fd);
     munmap(game_state, sizeof(GameState));
     shm_unlink("/yahtzee_shm");
