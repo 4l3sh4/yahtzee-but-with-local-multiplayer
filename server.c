@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>
-
+#include <sys/file.h>
 // Configuration
 #define MAX_PLAYERS 5
 #define MAX_ROUNDS 13
@@ -26,6 +26,9 @@
 
 #define QUANTUM_SECONDS 90
 
+#define LOG_QUEUE_SIZE 50
+#define LOG_MSG_LEN 256
+
 // Shared Memory Structure
 typedef struct {
     int current_turn;
@@ -35,6 +38,7 @@ typedef struct {
     int game_started;
     int game_round;
     int game_finished;
+    
 
     // NEW: Freeze who participates in the match at game start
     int participants[MAX_PLAYERS];      // 1 if this player is in THIS match
@@ -75,8 +79,27 @@ typedef struct {
 
 GameState *game_state;
 
+static pid_t server_pid;
+
+typedef struct {
+    char message[LOG_MSG_LEN];
+} LogEntry;
+
+LogEntry log_queue[LOG_QUEUE_SIZE];
+int log_head = 0;
+int log_tail = 0;
+
+pthread_mutex_t log_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+sem_t log_items_sem;
+sem_t log_slots_sem;
+
+pthread_t logger_thread_id;
+
 static void update_section_flags_nolock(int player_id);
 static int  maybe_award_upper_bonus_nolock(int player_id);
+void* logger_thread_func(void* arg);
+void save_scores_to_file(void);
+void load_scores_from_file(void);
 
 // ------------------------------ Helpers ------------------------------
 
@@ -165,6 +188,38 @@ static int timed_read_line(int fd, char *buf, size_t sz, const struct timespec *
     return n;
 }
 
+
+void log_message(const char* msg) {
+    if (getpid() != server_pid) return;
+    sem_wait(&log_slots_sem);
+    pthread_mutex_lock(&log_queue_mutex);
+    strncpy(log_queue[log_head].message, msg, LOG_MSG_LEN - 1);
+    log_queue[log_head].message[LOG_MSG_LEN - 1] = '\0';
+    log_head = (log_head + 1) % LOG_QUEUE_SIZE;
+    pthread_mutex_unlock(&log_queue_mutex);
+    sem_post(&log_items_sem);
+}
+
+void* logger_thread_func(void* arg) {
+    (void)arg;
+    while (1) {
+        sem_wait(&log_items_sem);
+        pthread_mutex_lock(&log_queue_mutex);
+        char msg[LOG_MSG_LEN];
+        strcpy(msg, log_queue[log_tail].message);
+        log_tail = (log_tail + 1) % LOG_QUEUE_SIZE;
+        pthread_mutex_unlock(&log_queue_mutex);
+        sem_post(&log_slots_sem);
+        
+        printf("[LOG] %s", msg);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+// (Logger semaphores are initialized in init_shared_memory)
+
+
 // ------------------------------ Endgame logic (NEW) ------------------------------
 
 static int player_finished_nolock(int pid) {
@@ -206,7 +261,16 @@ static void finalize_game_nolock(void) {
     game_state->winner_id = best;
     game_state->game_finished = 1;
 
-    if (best >= 0) game_state->total_wins[best] += 1;
+    if (best >= 0) {
+        game_state->total_wins[best] += 1;
+
+        /* persist updated total wins */
+        char log_buf[128];
+        snprintf(log_buf, sizeof(log_buf), "Game Over. Winner:Player %d (%s). Scores saved.\n", best + 1, game_state->player_names[best]);
+        log_message(log_buf);
+    }
+
+    save_scores_to_file();
 
     wake_all_players_nolock();
 }
@@ -296,6 +360,10 @@ void roll_dice(int player_id) {
     }
     pthread_mutex_unlock(&game_state->game_mutex);
     printf("[GAME] Player %d rolled dice\n", player_id + 1);
+
+    char roll_msg[128];
+    snprintf(roll_msg, sizeof(roll_msg), "Player %d rolled the dice.\n", player_id + 1);
+    log_message(roll_msg);
 }
 
 void reroll_dice(int player_id, int dice_to_reroll[], int count) {
@@ -409,6 +477,10 @@ int apply_score(int player_id, int category) {
     // NEW: check endgame right after scoring
     maybe_end_game_nolock();
 
+    char score_msg[128];
+    snprintf(score_msg, sizeof(score_msg), "Player %d succesfully scored %d points in category %d.\n", player_id + 1, game_state->player_scores[player_id][category][0], category + 1);
+    log_message(score_msg);
+
     pthread_mutex_unlock(&game_state->game_mutex);
     return 1;
 }
@@ -423,6 +495,71 @@ int calculate_total_score(int player_id) {
 
     return total;
 }
+
+#include <sys/file.h>  // Add at top with other includes
+
+void save_scores_to_file() {
+    int fd = open("scores.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        log_message("Error opening scores.txt for writing\n");
+        return;
+    }
+
+    flock(fd, LOCK_EX);
+
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+
+        // Skip the slots for empty players
+        if (game_state->player_names[p][0] == '\0')
+            continue;
+
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s:%d\n",
+                 game_state->player_names[p],
+                 game_state->total_wins[p]);
+
+        write(fd, buf, strlen(buf));
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
+    log_message("Scores saved to scores.txt\n");
+}
+
+
+void load_scores_from_file() {
+    int fd = open("scores.txt", O_RDONLY);
+    if (fd < 0) {
+        log_message("scores.txt not found, starting fresh\n");
+        return;
+    }
+    flock(fd, LOCK_SH);
+    char buf[BUFFER_SIZE];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        char *line = strtok(buf, "\n");
+        while (line) {
+            char name[NAME_SIZE];
+            int wins;
+            if (sscanf(line, "%[^:]:%d", name, &wins) == 2) {
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    if (strcmp(game_state->player_names[p], name) == 0) {
+                        game_state->total_wins[p] = wins;
+                        break;
+                    }
+                }
+            }
+            line = strtok(NULL, "\n");
+        }
+    }
+    flock(fd, LOCK_UN);
+    close(fd);
+    log_message("Scores loaded from scores.txt\n");
+}
+
+// (save/load calls are placed in finalize_game_nolock and main respectively)
+
 
 // ------------------------------ Shared Memory Init ------------------------------
 
@@ -467,6 +604,9 @@ int init_shared_memory() {
         game_state->turn_deadline[i].tv_sec = 0;
         game_state->turn_deadline[i].tv_nsec = 0;
     }
+
+    sem_init(&log_items_sem, 0, 0);
+    sem_init(&log_slots_sem, 0, LOG_QUEUE_SIZE);
 
     game_state->current_turn   = 0;
     game_state->active_players = 0;
@@ -571,6 +711,30 @@ static void reject_client(const char* client_fifo, const char* msg) {
 }
 
 // ------------------------------ Client Handler ------------------------------
+static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read_fd) {
+    pthread_mutex_lock(&game_state->game_mutex);
+
+    // mark disconnected
+    game_state->player_connected[player_id] = 0;
+
+    // if this player is part of an active match, force-forfeit them NOW
+    if (game_state->game_started &&
+        game_state->participants[player_id] &&
+        !game_state->player_done[player_id]) {
+
+        forfeit_remaining_on_disconnect_nolock(player_id);
+        // forfeit_remaining_on_disconnect_nolock() already sets player_done + maybe_end_game
+    }
+
+    pthread_mutex_unlock(&game_state->game_mutex);
+
+    // unblock scheduler if it was waiting on this player's slice
+    sem_post(&game_state->turn_done_sem[player_id]);
+
+    if (write_fd >= 0) close(write_fd);
+    if (read_fd  >= 0) close(read_fd);
+    _exit(0);
+}
 
 void handle_client(int player_id, const char* client_fifo) {
     char buffer[BUFFER_SIZE];
@@ -591,11 +755,16 @@ void handle_client(int player_id, const char* client_fifo) {
     write(write_fd, buffer, strlen(buffer));
 
     int n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
+    if (n <= 0) child_mark_disconnect_and_exit(player_id, write_fd, read_fd);
     if (n > 0) {
         recv_buffer[n] = '\0';
         recv_buffer[strcspn(recv_buffer, "\n")] = '\0';
         pthread_mutex_lock(&game_state->game_mutex);
         strncpy(game_state->player_names[player_id], recv_buffer, NAME_SIZE - 1);
+
+        char join_msg[128];
+        snprintf(join_msg, sizeof(join_msg), "Player %d identified as %s\n", player_id + 1, game_state->player_names[player_id]);
+        log_message(join_msg);
         pthread_mutex_unlock(&game_state->game_mutex);
     }
 
@@ -623,11 +792,8 @@ void handle_client(int player_id, const char* client_fifo) {
             write(write_fd, buffer, strlen(buffer));
 
             n = read(read_fd, recv_buffer, sizeof(recv_buffer) - 1);
-            if (n <= 0) {
-                close(write_fd);
-                close(read_fd);
-                exit(0);
-            }
+            if (n <= 0) child_mark_disconnect_and_exit(player_id, write_fd, read_fd);
+
             recv_buffer[n] = '\0';
             int t = atoi(recv_buffer);
 
@@ -745,7 +911,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
             n = timed_read_line(read_fd, recv_buffer, sizeof(recv_buffer), &deadline);
             if (n == -2) { forfeit_turn_timeout(player_id, write_fd); goto next_turn; }
-            if (n <= 0) break;
+            if (n <= 0) child_mark_disconnect_and_exit(player_id, write_fd, read_fd);
 
             if (recv_buffer[0] == 'N' || recv_buffer[0] == 'n') break;
 
@@ -755,7 +921,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
                 n = timed_read_line(read_fd, recv_buffer, sizeof(recv_buffer), &deadline);
                 if (n == -2) { forfeit_turn_timeout(player_id, write_fd); goto next_turn; }
-                if (n <= 0) break;
+                if (n <= 0) child_mark_disconnect_and_exit(player_id, write_fd, read_fd);
 
                 int dice_to_reroll[5];
                 int count = 0;
@@ -892,7 +1058,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
                 n = timed_read_line(read_fd, recv_buffer, sizeof(recv_buffer), &deadline);
                 if (n == -2) { forfeit_turn_timeout(player_id, write_fd); goto next_turn; }
-                if (n <= 0) break;
+                if (n <= 0) child_mark_disconnect_and_exit(player_id, write_fd, read_fd);
                 recv_buffer[n] = '\0';
 
                 choice = atoi(recv_buffer);
@@ -1014,7 +1180,6 @@ void handle_client(int player_id, const char* client_fifo) {
     forfeit_remaining_on_disconnect_nolock(player_id);
 
     game_state->player_connected[player_id] = 0;
-    game_state->active_players--;
     pthread_mutex_unlock(&game_state->game_mutex);
 
     snprintf(buffer, sizeof(buffer), "Disconnecting...\n");
@@ -1044,15 +1209,32 @@ void* scheduler_thread(void* arg) {
             break;
         }
 
-        // Find next participant who isn't done
+        // Find next schedulable player: participant, connected, not done.
         int start = turn_index;
-        while (!game_state->participants[turn_index] || game_state->player_done[turn_index]) {
+        int found = 0;
+
+        while (1) {
+            int is_participant = game_state->participants[turn_index];
+            int is_connected   = game_state->player_connected[turn_index];
+            int is_done        = game_state->player_done[turn_index];
+
+            if (is_participant && !is_connected && !is_done) {
+                // Participant disconnected mid-game -> forfeit them so game can end.
+                forfeit_remaining_on_disconnect_nolock(turn_index);
+                is_done = game_state->player_done[turn_index];
+            }
+
+            if (is_participant && is_connected && !is_done) {
+                found = 1;
+                break;
+            }
+
             turn_index = (turn_index + 1) % MAX_PLAYERS;
-            if (turn_index == start) break;
+            if (turn_index == start) break; // full cycle, none found
         }
 
-        if (!game_state->participants[turn_index] || game_state->player_done[turn_index]) {
-            // Nobody schedulable; either finished or broken state
+        if (!found) {
+            // Nobody schedulable right now.
             maybe_end_game_nolock();
             pthread_mutex_unlock(&game_state->game_mutex);
             nanosleep(&(struct timespec){0, 100000000}, NULL);
@@ -1091,7 +1273,6 @@ void* scheduler_thread(void* arg) {
             printf("[SCHEDULER] Player %d completed their turn.\n", turn_index + 1);
         }
 
-        // After each slice, re-check endgame
         pthread_mutex_lock(&game_state->game_mutex);
         maybe_end_game_nolock();
         pthread_mutex_unlock(&game_state->game_mutex);
@@ -1107,6 +1288,7 @@ void* scheduler_thread(void* arg) {
 
 int main() {
     srand((unsigned)time(NULL));
+    server_pid = getpid();
 
     printf("\n");
     printf("╔════════════════════════════════════════════╗\n");
@@ -1119,6 +1301,11 @@ int main() {
         fprintf(stderr, "Failed to initialize shared memory\n");
         return 1;
     }
+
+    /* Start logger thread first, then load persisted scores */
+    pthread_create(&logger_thread_id, NULL, logger_thread_func, NULL);
+    pthread_detach(logger_thread_id);
+    load_scores_from_file();
 
     setup_signal_handlers();
 
