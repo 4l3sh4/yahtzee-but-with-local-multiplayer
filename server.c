@@ -24,7 +24,7 @@
 #define FIFO_DIR "/tmp/yahtzee"
 #define SERVER_FIFO "/tmp/yahtzee/server_fifo"
 
-#define QUANTUM_SECONDS 90
+#define QUANTUM_SECONDS 60
 
 #define LOG_QUEUE_SIZE 50
 #define LOG_MSG_LEN 256
@@ -337,13 +337,13 @@ static void forfeit_turn_timeout(int player_id, int write_fd) {
     if (cat >= 0) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-                 "\n[TIMEOUT] 90 seconds expired. You forfeit this turn.\n"
+                 "\n[TIMEOUT] 60 seconds expired. You forfeit this turn.\n"
                  "Auto-scored 0 in your next available category (category #%d).\n"
                  "Turn ended.\n\n", cat + 1);
         write(write_fd, msg, strlen(msg));
     } else {
         const char *msg =
-            "\n[TIMEOUT] 90 seconds expired. No categories left to score.\n"
+            "\n[TIMEOUT] 60 seconds expired. No categories left to score.\n"
             "Turn ended.\n\n";
         write(write_fd, msg, strlen(msg));
     }
