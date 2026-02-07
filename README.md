@@ -1,4 +1,4 @@
-Yahtzee Server — Logger & Persistence (Member 4)
+Yahtzee Server
 
 Overview
 
