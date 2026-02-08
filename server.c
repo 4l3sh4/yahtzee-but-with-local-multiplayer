@@ -52,6 +52,10 @@ typedef struct {
     char player_names[MAX_PLAYERS][NAME_SIZE];
     int  player_connected[MAX_PLAYERS];
 
+    // NEW: child PID + forced turn end (quantum kill signal)
+    pid_t child_pid[MAX_PLAYERS];
+    volatile sig_atomic_t force_end_turn[MAX_PLAYERS];
+
     int  player_dice[MAX_PLAYERS][5];
     int  player_rerolls_left[MAX_PLAYERS];
 
@@ -80,6 +84,14 @@ typedef struct {
 GameState *game_state;
 
 static pid_t server_pid;
+static int g_child_player_id = -1;
+
+static void sigusr1_handler(int sig) {
+    (void)sig;
+    if (game_state && g_child_player_id >= 0 && g_child_player_id < MAX_PLAYERS) {
+        game_state->force_end_turn[g_child_player_id] = 1;
+    }
+}
 
 typedef struct {
     char message[LOG_MSG_LEN];
@@ -100,6 +112,9 @@ static int  maybe_award_upper_bonus_nolock(int player_id);
 void* logger_thread_func(void* arg);
 void save_scores_to_file(void);
 void load_scores_from_file(void);
+
+// Forward decl (used by disconnect watchdog)
+static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read_fd);
 
 // ------------------------------ Helpers ------------------------------
 
@@ -175,13 +190,25 @@ static int timed_read_line(int fd, char *buf, size_t sz, const struct timespec *
     int timeout_ms = ms_until_deadline(deadline);
     if (timeout_ms <= 0) return -2;
 
+    // If scheduler forced this turn to end, treat as timeout
+    // (safe even if called by non-turn code)
+    if (game_state && g_child_player_id >= 0 &&
+        g_child_player_id < MAX_PLAYERS &&
+        game_state->force_end_turn[g_child_player_id]) {
+        return -2;
+    }
+
+
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = POLLIN;
 
     int pr = poll(&pfd, 1, timeout_ms);
     if (pr == 0) return -2;
-    if (pr < 0) return -1;
+    if (pr < 0) {
+        if (errno == EINTR) return -2; // forced end / signal behaves like timeout
+        return -1;
+    }
 
     int n = (int)read(fd, buf, sz - 1);
     if (n > 0) buf[n] = '\0';
@@ -202,19 +229,81 @@ void log_message(const char* msg) {
 
 void* logger_thread_func(void* arg) {
     (void)arg;
+
+    FILE *fp = fopen("game.log", "a");
+    if (!fp) fp = stdout;
+
     while (1) {
         sem_wait(&log_items_sem);
+
         pthread_mutex_lock(&log_queue_mutex);
         char msg[LOG_MSG_LEN];
         strcpy(msg, log_queue[log_tail].message);
         log_tail = (log_tail + 1) % LOG_QUEUE_SIZE;
         pthread_mutex_unlock(&log_queue_mutex);
+
         sem_post(&log_slots_sem);
-        
-        printf("[LOG] %s", msg);
-        fflush(stdout);
+
+        fprintf(fp, "%s", msg);
+        fflush(fp);
     }
     return NULL;
+}
+
+// ------------------------------ Disconnect watchdog (NEW) ------------------------------
+// Detect client FIFO hangup even while the child is blocked on sem_wait(turn_sem).
+typedef struct {
+    int player_id;
+    int read_fd;
+    int write_fd;
+} WatchArgs;
+
+static void* disconnect_watchdog(void* arg) {
+    WatchArgs* wa = (WatchArgs*)arg;
+
+    struct pollfd pfd;
+    pfd.fd = wa->read_fd;
+    pfd.events = POLLIN | POLLHUP | POLLERR;
+
+    while (1) {
+        int pr = poll(&pfd, 1, 200); // 200ms granularity
+        if (pr > 0) {
+            if (pfd.revents & (POLLHUP | POLLERR)) {
+                // Will _exit() the process
+                child_mark_disconnect_and_exit(wa->player_id, wa->write_fd, wa->read_fd);
+            }
+        }
+    }
+    return NULL;
+}
+
+// Wait for turn completion, but stop immediately if player disconnects or child dies.
+static int wait_turn_done_or_disconnect(int pid, int quantum_sec) {
+    struct timespec end;
+    clock_gettime(CLOCK_REALTIME, &end);
+    end.tv_sec += quantum_sec;
+
+    while (1) {
+        // If player disconnected, stop waiting immediately
+        if (!game_state->player_connected[pid]) return 1;
+
+        // If child process is gone, treat as disconnect
+        pid_t cpid = game_state->child_pid[pid];
+        if (cpid > 0 && kill(cpid, 0) == -1 && errno == ESRCH) return 1;
+
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (timespec_cmp(&now, &end) >= 0) return -1; // timeout
+
+        // short slice wait (200ms)
+        struct timespec slice = now;
+        slice.tv_nsec += 200 * 1000 * 1000;
+        if (slice.tv_nsec >= 1000000000L) { slice.tv_sec++; slice.tv_nsec -= 1000000000L; }
+
+        int r = sem_timedwait(&game_state->turn_done_sem[pid], &slice);
+        if (r == 0) return 0;              // completed turn
+        if (errno != ETIMEDOUT) return 0;  // treat other errors as done-ish
+    }
 }
 
 // (Logger semaphores are initialized in init_shared_memory)
@@ -603,6 +692,9 @@ int init_shared_memory() {
         game_state->turn_active[i] = 0;
         game_state->turn_deadline[i].tv_sec = 0;
         game_state->turn_deadline[i].tv_nsec = 0;
+        game_state->child_pid[i] = -1;
+        game_state->force_end_turn[i] = 0;
+
     }
 
     sem_init(&log_items_sem, 0, 0);
@@ -714,8 +806,12 @@ static void reject_client(const char* client_fifo, const char* msg) {
 static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read_fd) {
     pthread_mutex_lock(&game_state->game_mutex);
 
-    // mark disconnected
-    game_state->player_connected[player_id] = 0;
+    // mark disconnected + maintain active_players
+    if (game_state->player_connected[player_id]) {
+        game_state->player_connected[player_id] = 0;
+        if (game_state->active_players > 0) game_state->active_players--;
+    }
+    game_state->child_pid[player_id] = -1;
 
     // if this player is part of an active match, force-forfeit them NOW
     if (game_state->game_started &&
@@ -737,6 +833,17 @@ static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read
 }
 
 void handle_client(int player_id, const char* client_fifo) {
+    // NEW: allow scheduler to force-end this player's turn on quantum expiry
+    g_child_player_id = player_id;
+    {
+        struct sigaction sa2;
+        memset(&sa2, 0, sizeof(sa2));
+        sa2.sa_handler = sigusr1_handler;
+        sigemptyset(&sa2.sa_mask);
+        sa2.sa_flags = 0; // IMPORTANT: no SA_RESTART, so poll/read can be interrupted
+        sigaction(SIGUSR1, &sa2, NULL);
+    }
+    
     char buffer[BUFFER_SIZE];
     char recv_buffer[256];
     char client_read_fifo[256];
@@ -750,6 +857,19 @@ void handle_client(int player_id, const char* client_fifo) {
         perror("open FIFOs failed");
         exit(1);
     }
+
+    // NEW: watchdog to detect client disconnect even while blocked on sem_wait(turn_sem)
+    WatchArgs *wa = (WatchArgs*)malloc(sizeof(*wa));
+    if (!wa) {
+        perror("malloc watchdog");
+        child_mark_disconnect_and_exit(player_id, write_fd, read_fd);
+    }
+    wa->player_id = player_id;
+    wa->read_fd   = read_fd;
+    wa->write_fd  = write_fd;
+    pthread_t wd_tid;
+    pthread_create(&wd_tid, NULL, disconnect_watchdog, wa);
+    pthread_detach(wd_tid);
 
     snprintf(buffer, sizeof(buffer), "Enter your name: ");
     write(write_fd, buffer, strlen(buffer));
@@ -1175,11 +1295,14 @@ void handle_client(int player_id, const char* client_fifo) {
         pthread_mutex_unlock(&game_state->game_mutex);
     }
 
-    // Disconnect handling: if a participant disconnects early, auto-forfeit remaining (prevents deadlock)
+    // Normal session end: mark disconnected + maintain active_players.
+    // (Early disconnect forfeits are handled in child_mark_disconnect_and_exit / scheduler.)
     pthread_mutex_lock(&game_state->game_mutex);
-    forfeit_remaining_on_disconnect_nolock(player_id);
-
-    game_state->player_connected[player_id] = 0;
+    if (game_state->player_connected[player_id]) {
+        game_state->player_connected[player_id] = 0;
+        if (game_state->active_players > 0) game_state->active_players--;
+    }
+    game_state->child_pid[player_id] = -1;
     pthread_mutex_unlock(&game_state->game_mutex);
 
     snprintf(buffer, sizeof(buffer), "Disconnecting...\n");
@@ -1255,20 +1378,43 @@ void* scheduler_thread(void* arg) {
         game_state->turn_deadline[turn_index].tv_sec += QUANTUM_SECONDS;
         pthread_mutex_unlock(&game_state->game_mutex);
 
+
+        // NEW: avoid late posts from previous turn instantly completing next turn
+        while (sem_trywait(&game_state->turn_done_sem[turn_index]) == 0) {
+        }
+
+        pthread_mutex_lock(&game_state->game_mutex);
+        game_state->force_end_turn[turn_index] = 0; // clear for fresh quantum
+        pthread_mutex_unlock(&game_state->game_mutex);
+
         sem_post(&game_state->turn_sem[turn_index]);
 
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += QUANTUM_SECONDS;
-
-        int r = sem_timedwait(&game_state->turn_done_sem[turn_index], &ts);
+        int r = wait_turn_done_or_disconnect(turn_index, QUANTUM_SECONDS);
 
         pthread_mutex_lock(&game_state->game_mutex);
         game_state->turn_active[turn_index] = 0;
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        if (r == -1 && errno == ETIMEDOUT) {
+        if (r == -1) {
             printf("[SCHEDULER] Player %d quantum expired\n", turn_index + 1);
+
+            pthread_mutex_lock(&game_state->game_mutex);
+            pid_t cpid = game_state->child_pid[turn_index];
+            game_state->force_end_turn[turn_index] = 1;
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            if (cpid > 0) {
+                kill(cpid, SIGUSR1);
+            }
+        } else if (r == 1) {
+            printf("[SCHEDULER] Player %d disconnected during turn\n", turn_index + 1);
+
+            // Immediately forfeit to prevent ghost turns and allow game to end.
+            pthread_mutex_lock(&game_state->game_mutex);
+            if (game_state->participants[turn_index] && !game_state->player_done[turn_index]) {
+                forfeit_remaining_on_disconnect_nolock(turn_index);
+            }
+            pthread_mutex_unlock(&game_state->game_mutex);
         } else {
             printf("[SCHEDULER] Player %d completed their turn.\n", turn_index + 1);
         }
@@ -1282,6 +1428,48 @@ void* scheduler_thread(void* arg) {
 
     printf("[SCHEDULER] Scheduler ending\n");
     return NULL;
+}
+
+//--------------------------Lobby Reset-------------------------------
+static void reset_lobby_state_nolock(void) {
+    game_state->current_turn   = 0;
+    game_state->active_players = 0;
+    game_state->target_players = 0;
+    game_state->host_player_id = -1;
+    game_state->game_started   = 0;
+    game_state->game_round     = 1;
+    game_state->game_finished  = 0;
+    game_state->winner_id      = -1;
+    game_state->participants_count = 0;
+
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        game_state->participants[p] = 0;
+        game_state->player_done[p] = 0;
+        game_state->final_scores[p] = 0;
+        game_state->player_connected[p] = 0;
+        game_state->child_pid[p] = -1;
+        game_state->force_end_turn[p] = 0;
+
+        // wipe match scorecard
+        for (int i = 0; i < 15; i++)
+            for (int k = 0; k < 3; k++)
+                game_state->player_scores[p][i][k] = 0;
+
+        // wipe per-match flags
+        game_state->yahtzee_achieved[p] = 'N';
+        game_state->amount_yahtzee[p] = 0;
+        game_state->required_upper_section[p] = -1;
+        game_state->lower_section_only[p] = 'N';
+        game_state->skip_scoring[p] = 'N';
+        game_state->bonus_achieved[p] = 'N';
+        game_state->upper_section_filled[p] = 'N';
+        game_state->lower_section_filled[p] = 'N';
+
+        memset(game_state->player_names[p], 0, NAME_SIZE);
+
+        // semaphores: they stay initialized; just drain done_sem to avoid stale posts
+        while (sem_trywait(&game_state->turn_done_sem[p]) == 0) {}
+    }
 }
 
 // ------------------------------ Main ------------------------------
@@ -1320,6 +1508,7 @@ int main() {
 
     pthread_t scheduler_tid;
     int scheduler_created = 0;
+    int reset_pending = 0;
 
     int server_fd = open(SERVER_FIFO, O_RDWR | O_NONBLOCK);
     if (server_fd < 0) {
@@ -1358,7 +1547,7 @@ int main() {
                     if (already_started) {
                         printf("[CONNECTION] Rejected - game already started\n");
                         reject_client(client_fifo,
-                                      "Server: Game already started. Please restart server for a new game.\n");
+                                      "Server: Game already started. Please wait for the next lobby.\n");
                         continue;
                     }
 
@@ -1400,9 +1589,14 @@ int main() {
                         handle_client(player_id, client_fifo);
                         exit(0);
                     } else {
+                        pthread_mutex_lock(&game_state->game_mutex);
+                        game_state->child_pid[player_id] = pid;
+                        pthread_mutex_unlock(&game_state->game_mutex);
+
                         printf("[FORK] Created child process PID %d for Player %d\n",
                                pid, player_id + 1);
                     }
+
                 }
             }
 
@@ -1443,6 +1637,36 @@ int main() {
             printf("\n*** GAME STARTING with %d players! ***\n\n", target);
         } else {
             pthread_mutex_unlock(&game_state->game_mutex);
+        }
+
+        // If a game finished, stop scheduler now.
+        // BUT do NOT reset lobby until all players have disconnected (active_players == 0),
+        // otherwise you can wipe names/scores while children are still printing GAME OVER.
+        if (scheduler_created && !reset_pending) {
+            pthread_mutex_lock(&game_state->game_mutex);
+            int finished = game_state->game_finished;
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            if (finished) {
+                pthread_join(scheduler_tid, NULL);
+                scheduler_created = 0;
+                reset_pending = 1;
+            }
+        }
+
+        if (reset_pending) {
+            pthread_mutex_lock(&game_state->game_mutex);
+            int ap = game_state->active_players;
+            pthread_mutex_unlock(&game_state->game_mutex);
+
+            if (ap == 0) {
+                pthread_mutex_lock(&game_state->game_mutex);
+                reset_lobby_state_nolock();
+                pthread_mutex_unlock(&game_state->game_mutex);
+
+                reset_pending = 0;
+                printf("\n[SERVER] Lobby reset. Waiting for new players...\n");
+            }
         }
 
         struct timespec ts = {0, 100000000};
