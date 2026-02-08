@@ -1,14 +1,5 @@
 Yahtzee Server
 
-Overview
-
-* This project implements a Yahtzee server with IPC-based local multiplayer.
-* Member 4 responsibilities implemented here:
-
-  * Logger thread with a bounded log queue ('LOG_QUEUE_SIZE') and semaphores.
-  * Persistence of 'total_wins' per player to 'scores.txt' with 'flock' locking.
-  * Documentation and test evidence.
-
 Files of interest
 
 * server.c : Main server with logger and persistence added.
