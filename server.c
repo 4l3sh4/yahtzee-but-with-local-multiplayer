@@ -16,6 +16,7 @@
 #include <time.h>
 #include <poll.h>
 #include <sys/file.h>
+
 // Configuration
 #define MAX_PLAYERS 5
 #define MAX_ROUNDS 13
@@ -39,20 +40,16 @@ typedef struct {
     int game_round;
     int game_finished;
     
+    int participants[MAX_PLAYERS];      
+    int participants_count;             
 
-    // NEW: Freeze who participates in the match at game start
-    int participants[MAX_PLAYERS];      // 1 if this player is in THIS match
-    int participants_count;             // should == target_players at start
-
-    // NEW: endgame bookkeeping
-    int player_done[MAX_PLAYERS];       // 1 if filled 13 categories (or forfeited)
+    int player_done[MAX_PLAYERS];       
     int final_scores[MAX_PLAYERS];
     int winner_id;
 
     char player_names[MAX_PLAYERS][NAME_SIZE];
     int  player_connected[MAX_PLAYERS];
 
-    // NEW: child PID + forced turn end (quantum kill signal)
     pid_t child_pid[MAX_PLAYERS];
     volatile sig_atomic_t force_end_turn[MAX_PLAYERS];
 
@@ -93,6 +90,7 @@ static void sigusr1_handler(int sig) {
     }
 }
 
+// Logging Structure
 typedef struct {
     char message[LOG_MSG_LEN];
 } LogEntry;
@@ -113,10 +111,10 @@ void* logger_thread_func(void* arg);
 void save_scores_to_file(void);
 void load_scores_from_file(void);
 
-// Forward decl (used by disconnect watchdog)
 static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read_fd);
 
-// ------------------------------ Helpers ------------------------------
+
+// Helpers
 
 int compare_int(const void *a, const void *b) {
     return (*(int*)a - *(int*)b);
@@ -181,17 +179,11 @@ static int ms_until_deadline(const struct timespec *deadline) {
     return (int)ms;
 }
 
-// reads up to (sz-1) bytes, returns:
-//  >0 bytes read
-//   0 EOF
-//  -1 error
-//  -2 turn timed out
 static int timed_read_line(int fd, char *buf, size_t sz, const struct timespec *deadline) {
     int timeout_ms = ms_until_deadline(deadline);
     if (timeout_ms <= 0) return -2;
 
     // If scheduler forced this turn to end, treat as timeout
-    // (safe even if called by non-turn code)
     if (game_state && g_child_player_id >= 0 &&
         g_child_player_id < MAX_PLAYERS &&
         game_state->force_end_turn[g_child_player_id]) {
@@ -206,7 +198,7 @@ static int timed_read_line(int fd, char *buf, size_t sz, const struct timespec *
     int pr = poll(&pfd, 1, timeout_ms);
     if (pr == 0) return -2;
     if (pr < 0) {
-        if (errno == EINTR) return -2; // forced end / signal behaves like timeout
+        if (errno == EINTR) return -2; 
         return -1;
     }
 
@@ -250,8 +242,8 @@ void* logger_thread_func(void* arg) {
     return NULL;
 }
 
-// ------------------------------ Disconnect watchdog (NEW) ------------------------------
-// Detect client FIFO hangup even while the child is blocked on sem_wait(turn_sem).
+
+// Detect client FIFO hangup even while the child is blocked
 typedef struct {
     int player_id;
     int read_fd;
@@ -266,10 +258,9 @@ static void* disconnect_watchdog(void* arg) {
     pfd.events = POLLIN | POLLHUP | POLLERR;
 
     while (1) {
-        int pr = poll(&pfd, 1, 200); // 200ms granularity
+        int pr = poll(&pfd, 1, 200); 
         if (pr > 0) {
             if (pfd.revents & (POLLHUP | POLLERR)) {
-                // Will _exit() the process
                 child_mark_disconnect_and_exit(wa->player_id, wa->write_fd, wa->read_fd);
             }
         }
@@ -277,7 +268,7 @@ static void* disconnect_watchdog(void* arg) {
     return NULL;
 }
 
-// Wait for turn completion, but stop immediately if player disconnects or child dies.
+// Wait for turn to complete but stop immediately if player disconnects or child dies
 static int wait_turn_done_or_disconnect(int pid, int quantum_sec) {
     struct timespec end;
     clock_gettime(CLOCK_REALTIME, &end);
@@ -295,21 +286,19 @@ static int wait_turn_done_or_disconnect(int pid, int quantum_sec) {
         clock_gettime(CLOCK_REALTIME, &now);
         if (timespec_cmp(&now, &end) >= 0) return -1; // timeout
 
-        // short slice wait (200ms)
+        // short slice wait for 200ms
         struct timespec slice = now;
         slice.tv_nsec += 200 * 1000 * 1000;
         if (slice.tv_nsec >= 1000000000L) { slice.tv_sec++; slice.tv_nsec -= 1000000000L; }
 
         int r = sem_timedwait(&game_state->turn_done_sem[pid], &slice);
-        if (r == 0) return 0;              // completed turn
-        if (errno != ETIMEDOUT) return 0;  // treat other errors as done-ish
+        if (r == 0) return 0;              
+        if (errno != ETIMEDOUT) return 0; 
     }
 }
 
-// (Logger semaphores are initialized in init_shared_memory)
 
-
-// ------------------------------ Endgame logic (NEW) ------------------------------
+// Endgame Logic
 
 static int player_finished_nolock(int pid) {
     int scored = 0;
@@ -322,7 +311,7 @@ static int player_finished_nolock(int pid) {
 static void wake_all_players_nolock(void) {
     for (int p = 0; p < MAX_PLAYERS; p++) {
         if (game_state->participants[p]) {
-            sem_post(&game_state->turn_sem[p]); // release any sem_wait stuck clients
+            sem_post(&game_state->turn_sem[p]);
         }
     }
 }
@@ -353,7 +342,7 @@ static void finalize_game_nolock(void) {
     if (best >= 0) {
         game_state->total_wins[best] += 1;
 
-        /* persist updated total wins */
+        // Persist updated total wins
         char log_buf[128];
         snprintf(log_buf, sizeof(log_buf), "Game Over. Winner:Player %d (%s). Scores saved.\n", best + 1, game_state->player_names[best]);
         log_message(log_buf);
@@ -380,7 +369,7 @@ static void maybe_end_game_nolock(void) {
     if (done == need) finalize_game_nolock();
 }
 
-// Auto-forfeit remaining categories on disconnect (NEW safety)
+// Auto-forfeit remaining categories on disconnect
 static void forfeit_remaining_on_disconnect_nolock(int player_id) {
     if (!game_state->participants[player_id]) return;
     if (game_state->player_done[player_id]) return;
@@ -398,7 +387,8 @@ static void forfeit_remaining_on_disconnect_nolock(int player_id) {
     maybe_end_game_nolock();
 }
 
-// ------------------------------ Timeout scoring ------------------------------
+
+// Timeout scoring 
 
 static int apply_zero_next_available_nolock(int player_id) {
     for (int cat = 0; cat < 13; cat++) {
@@ -440,7 +430,8 @@ static void forfeit_turn_timeout(int player_id, int write_fd) {
     sem_post(&game_state->turn_done_sem[player_id]);
 }
 
-// ------------------------------ Game logic ------------------------------
+
+// Game logic
 
 void roll_dice(int player_id) {
     pthread_mutex_lock(&game_state->game_mutex);
@@ -563,7 +554,7 @@ int apply_score(int player_id, int category) {
     update_section_flags_nolock(player_id);
     maybe_award_upper_bonus_nolock(player_id);
 
-    // NEW: check endgame right after scoring
+    // Check endgame right after scoring
     maybe_end_game_nolock();
 
     char score_msg[128];
@@ -584,8 +575,6 @@ int calculate_total_score(int player_id) {
 
     return total;
 }
-
-#include <sys/file.h>  // Add at top with other includes
 
 void save_scores_to_file() {
     int fd = open("scores.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -647,8 +636,8 @@ void load_scores_from_file() {
     log_message("Scores loaded from scores.txt\n");
 }
 
-// For rematches in the same server run: when a client reconnects and provides a name,
-// load their existing wins from scores.txt so they don't lose their scoreboard.
+
+// Load existing wins from scores.txt when rematch
 static int lookup_wins_for_name(const char *name) {
     int fd = open("scores.txt", O_RDONLY);
     if (fd < 0) return 0;
@@ -677,10 +666,8 @@ static int lookup_wins_for_name(const char *name) {
     return wins;
 }
 
-// (save/load calls are placed in finalize_game_nolock and main respectively)
 
-
-// ------------------------------ Shared Memory Init ------------------------------
+// Shared Memory 
 
 int init_shared_memory() {
     shm_unlink("/yahtzee_shm");
@@ -738,7 +725,6 @@ int init_shared_memory() {
     game_state->game_round     = 1;
     game_state->game_finished  = 0;
 
-    // NEW init
     game_state->participants_count = 0;
     game_state->winner_id = -1;
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -773,7 +759,7 @@ int init_shared_memory() {
     return 0;
 }
 
-// ------------------------------ SIGCHLD ------------------------------
+// SIGCHLD 
 
 void sigchld_handler(int sig) {
     (void)sig;
@@ -797,7 +783,7 @@ void setup_signal_handlers() {
     printf("✓ Signal handlers set up\n");
 }
 
-// ------------------------------ IPC ------------------------------
+// IPC setup
 
 int setup_ipc_server() {
     struct stat st = {0};
@@ -832,24 +818,23 @@ static void reject_client(const char* client_fifo, const char* msg) {
     if (rfd >= 0) close(rfd);
 }
 
-// ------------------------------ Client Handler ------------------------------
+// Client Handler 
 static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read_fd) {
     pthread_mutex_lock(&game_state->game_mutex);
 
-    // mark disconnected + maintain active_players
+    // mark disconnected and maintain active_players
     if (game_state->player_connected[player_id]) {
         game_state->player_connected[player_id] = 0;
         if (game_state->active_players > 0) game_state->active_players--;
     }
     game_state->child_pid[player_id] = -1;
 
-    // if this player is part of an active match, force-forfeit them NOW
+    // if this player is part of an active match, force-forfeit them
     if (game_state->game_started &&
         game_state->participants[player_id] &&
         !game_state->player_done[player_id]) {
 
         forfeit_remaining_on_disconnect_nolock(player_id);
-        // forfeit_remaining_on_disconnect_nolock() already sets player_done + maybe_end_game
     }
 
     pthread_mutex_unlock(&game_state->game_mutex);
@@ -863,14 +848,14 @@ static void child_mark_disconnect_and_exit(int player_id, int write_fd, int read
 }
 
 void handle_client(int player_id, const char* client_fifo) {
-    // NEW: allow scheduler to force-end this player's turn on quantum expiry
+    // allow scheduler to force-end this player's turn on quantum expiry
     g_child_player_id = player_id;
     {
         struct sigaction sa2;
         memset(&sa2, 0, sizeof(sa2));
         sa2.sa_handler = sigusr1_handler;
         sigemptyset(&sa2.sa_mask);
-        sa2.sa_flags = 0; // IMPORTANT: no SA_RESTART, so poll/read can be interrupted
+        sa2.sa_flags = 0; 
         sigaction(SIGUSR1, &sa2, NULL);
     }
     
@@ -888,7 +873,7 @@ void handle_client(int player_id, const char* client_fifo) {
         exit(1);
     }
 
-    // NEW: watchdog to detect client disconnect even while blocked on sem_wait(turn_sem)
+    // watchdog to detect client disconnect even while blocked
     WatchArgs *wa = (WatchArgs*)malloc(sizeof(*wa));
     if (!wa) {
         perror("malloc watchdog");
@@ -917,7 +902,7 @@ void handle_client(int player_id, const char* client_fifo) {
         log_message(join_msg);
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        // Restore wins for this name (rematch-friendly, no server restart needed)
+        // Restore wins for this name
         int restored = lookup_wins_for_name(game_state->player_names[player_id]);
         pthread_mutex_lock(&game_state->game_mutex);
         game_state->total_wins[player_id] = restored;
@@ -1005,7 +990,7 @@ void handle_client(int player_id, const char* client_fifo) {
         sleep(1);
     }
 
-    // If this player isn't a participant (shouldn't happen), exit.
+    // Exit if this player isn't a participant
     pthread_mutex_lock(&game_state->game_mutex);
     int am_participant = game_state->participants[player_id];
     pthread_mutex_unlock(&game_state->game_mutex);
@@ -1025,7 +1010,6 @@ void handle_client(int player_id, const char* client_fifo) {
         "Small Straight", "Large Straight", "Yahtzee", "Chance"
     };
 
-    // NEW: real loop (not fake round counter)
     while (1) {
         sem_wait(&game_state->turn_sem[player_id]);
 
@@ -1136,7 +1120,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
                     int req = game_state->required_upper_section[player_id]; // 0..5
                     if (req >= 0 && req < 6 && game_state->player_scores[player_id][req][1] == 0) {
-                        // Auto-score required upper section
+
                         game_state->player_scores[player_id][req][0] =
                             game_state->player_scores[player_id][req][2];
                         game_state->player_scores[player_id][req][1] = 1;
@@ -1149,7 +1133,6 @@ void handle_client(int player_id, const char* client_fifo) {
 
                         game_state->skip_scoring[player_id] = 'Y';
 
-                        // NEW: end-check after auto-fill
                         update_section_flags_nolock(player_id);
                         maybe_award_upper_bonus_nolock(player_id);
                         maybe_end_game_nolock();
@@ -1178,7 +1161,7 @@ void handle_client(int player_id, const char* client_fifo) {
 
         pthread_mutex_unlock(&game_state->game_mutex);
 
-        // Scoring selection (skip if server auto-scored required upper box)
+        // Scoring selection 
         if (game_state->skip_scoring[player_id] == 'N') {
             snprintf(buffer, sizeof(buffer), "\n=== SCORING OPTIONS ===\n");
             write(write_fd, buffer, strlen(buffer));
@@ -1238,7 +1221,7 @@ void handle_client(int player_id, const char* client_fifo) {
             }
         }
 
-        // If player just finished, mark done (redundant but safe)
+        // If player just finished mark as done
         pthread_mutex_lock(&game_state->game_mutex);
         if (player_finished_nolock(player_id)) game_state->player_done[player_id] = 1;
         maybe_end_game_nolock();
@@ -1297,7 +1280,7 @@ void handle_client(int player_id, const char* client_fifo) {
         ;
     }
 
-    // GAME OVER output (winner + table)
+    // GAME OVER output
     pthread_mutex_lock(&game_state->game_mutex);
     int winner = game_state->winner_id;
     int my_final = game_state->final_scores[player_id];
@@ -1331,8 +1314,6 @@ void handle_client(int player_id, const char* client_fifo) {
         pthread_mutex_unlock(&game_state->game_mutex);
     }
 
-    // Normal session end: mark disconnected + maintain active_players.
-    // (Early disconnect forfeits are handled in child_mark_disconnect_and_exit / scheduler.)
     pthread_mutex_lock(&game_state->game_mutex);
     if (game_state->player_connected[player_id]) {
         game_state->player_connected[player_id] = 0;
@@ -1352,7 +1333,7 @@ void handle_client(int player_id, const char* client_fifo) {
     exit(0);
 }
 
-// ------------------------------ Scheduler ------------------------------
+// Scheduler
 
 void* scheduler_thread(void* arg) {
     (void)arg;
@@ -1368,7 +1349,7 @@ void* scheduler_thread(void* arg) {
             break;
         }
 
-        // Find next schedulable player: participant, connected, not done.
+        // Find next schedulable player
         int start = turn_index;
         int found = 0;
 
@@ -1378,7 +1359,7 @@ void* scheduler_thread(void* arg) {
             int is_done        = game_state->player_done[turn_index];
 
             if (is_participant && !is_connected && !is_done) {
-                // Participant disconnected mid-game -> forfeit them so game can end.
+                // If participant disconnected mid-game, forfeit them
                 forfeit_remaining_on_disconnect_nolock(turn_index);
                 is_done = game_state->player_done[turn_index];
             }
@@ -1389,11 +1370,10 @@ void* scheduler_thread(void* arg) {
             }
 
             turn_index = (turn_index + 1) % MAX_PLAYERS;
-            if (turn_index == start) break; // full cycle, none found
+            if (turn_index == start) break;
         }
 
         if (!found) {
-            // Nobody schedulable right now.
             maybe_end_game_nolock();
             pthread_mutex_unlock(&game_state->game_mutex);
             nanosleep(&(struct timespec){0, 100000000}, NULL);
@@ -1415,12 +1395,12 @@ void* scheduler_thread(void* arg) {
         pthread_mutex_unlock(&game_state->game_mutex);
 
 
-        // NEW: avoid late posts from previous turn instantly completing next turn
+        // Avoid late posts from previous turn instantly completing next turn
         while (sem_trywait(&game_state->turn_done_sem[turn_index]) == 0) {
         }
 
         pthread_mutex_lock(&game_state->game_mutex);
-        game_state->force_end_turn[turn_index] = 0; // clear for fresh quantum
+        game_state->force_end_turn[turn_index] = 0;
         pthread_mutex_unlock(&game_state->game_mutex);
 
         sem_post(&game_state->turn_sem[turn_index]);
@@ -1445,7 +1425,7 @@ void* scheduler_thread(void* arg) {
         } else if (r == 1) {
             printf("[SCHEDULER] Player %d disconnected during turn\n", turn_index + 1);
 
-            // Immediately forfeit to prevent ghost turns and allow game to end.
+            // Immediately forfeit to prevent ghost turns and allow game to end
             pthread_mutex_lock(&game_state->game_mutex);
             if (game_state->participants[turn_index] && !game_state->player_done[turn_index]) {
                 forfeit_remaining_on_disconnect_nolock(turn_index);
@@ -1466,7 +1446,7 @@ void* scheduler_thread(void* arg) {
     return NULL;
 }
 
-//--------------------------Lobby Reset-------------------------------
+// Lobby Reset
 static void reset_lobby_state_nolock(void) {
     game_state->current_turn   = 0;
     game_state->active_players = 0;
@@ -1503,12 +1483,11 @@ static void reset_lobby_state_nolock(void) {
 
         memset(game_state->player_names[p], 0, NAME_SIZE);
 
-        // semaphores: they stay initialized; just drain done_sem to avoid stale posts
         while (sem_trywait(&game_state->turn_done_sem[p]) == 0) {}
     }
 }
 
-// ------------------------------ Main ------------------------------
+// Main
 
 int main() {
     srand((unsigned)time(NULL));
@@ -1526,7 +1505,7 @@ int main() {
         return 1;
     }
 
-    /* Start logger thread first, then load persisted scores */
+    // Start logger thread first, then load persisted scores
     pthread_create(&logger_thread_id, NULL, logger_thread_func, NULL);
     pthread_detach(logger_thread_id);
     load_scores_from_file();
@@ -1650,7 +1629,6 @@ int main() {
         int connected = game_state->active_players;
 
         if (!scheduler_created && !game_state->game_started && target > 0 && connected >= target) {
-            // NEW: freeze participants NOW
             game_state->participants_count = 0;
             for (int p = 0; p < MAX_PLAYERS; p++) {
                 if (game_state->player_connected[p] && game_state->participants_count < target) {
@@ -1675,9 +1653,7 @@ int main() {
             pthread_mutex_unlock(&game_state->game_mutex);
         }
 
-        // If a game finished, stop scheduler now.
-        // BUT do NOT reset lobby until all players have disconnected (active_players == 0),
-        // otherwise you can wipe names/scores while children are still printing GAME OVER.
+        // If a game finished, scheduler will stop
         if (scheduler_created && !reset_pending) {
             pthread_mutex_lock(&game_state->game_mutex);
             int finished = game_state->game_finished;
