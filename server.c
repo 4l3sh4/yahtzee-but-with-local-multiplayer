@@ -647,6 +647,36 @@ void load_scores_from_file() {
     log_message("Scores loaded from scores.txt\n");
 }
 
+// For rematches in the same server run: when a client reconnects and provides a name,
+// load their existing wins from scores.txt so they don't lose their scoreboard.
+static int lookup_wins_for_name(const char *name) {
+    int fd = open("scores.txt", O_RDONLY);
+    if (fd < 0) return 0;
+
+    flock(fd, LOCK_SH);
+
+    char buf[BUFFER_SIZE];
+    ssize_t n;
+    int wins = 0;
+
+    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        char *line = strtok(buf, "\n");
+        while (line) {
+            char file_name[NAME_SIZE];
+            int file_wins;
+            if (sscanf(line, "%49[^:]:%d", file_name, &file_wins) == 2) {
+                if (strcmp(file_name, name) == 0) wins = file_wins;
+            }
+            line = strtok(NULL, "\n");
+        }
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
+    return wins;
+}
+
 // (save/load calls are placed in finalize_game_nolock and main respectively)
 
 
@@ -885,6 +915,12 @@ void handle_client(int player_id, const char* client_fifo) {
         char join_msg[128];
         snprintf(join_msg, sizeof(join_msg), "Player %d identified as %s\n", player_id + 1, game_state->player_names[player_id]);
         log_message(join_msg);
+        pthread_mutex_unlock(&game_state->game_mutex);
+
+        // Restore wins for this name (rematch-friendly, no server restart needed)
+        int restored = lookup_wins_for_name(game_state->player_names[player_id]);
+        pthread_mutex_lock(&game_state->game_mutex);
+        game_state->total_wins[player_id] = restored;
         pthread_mutex_unlock(&game_state->game_mutex);
     }
 
