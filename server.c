@@ -1333,7 +1333,7 @@ void handle_client(int player_id, const char* client_fifo) {
     exit(0);
 }
 
-// Scheduler
+// RR Scheduler
 
 void* scheduler_thread(void* arg) {
     (void)arg;
