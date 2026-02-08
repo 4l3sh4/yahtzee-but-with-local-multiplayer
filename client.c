@@ -7,6 +7,7 @@
 #include <fcntl.h>
 
 #define BUFFER_SIZE 2048
+#define NAME_SIZE 50
 #define FIFO_DIR "/tmp/yahtzee"
 #define SERVER_FIFO "/tmp/yahtzee/server_fifo"
 
@@ -16,6 +17,9 @@ int main() {
     char buffer[BUFFER_SIZE];
     char input[256];
     int server_fd, write_fd, read_fd;
+
+    // Persist player name across rematches within this client process
+    static char saved_name[NAME_SIZE] = {0};
     
     printf("\n");
     printf("╔═══════════════════════════════════════╗\n");
@@ -131,9 +135,30 @@ int main() {
         }
 
             if (needs_input) {
-                // Get user input
+                // Auto-fill name on rematch so user doesn't need to retype it.
+                if (strstr(buffer, "Enter your name")) {
+                    if (saved_name[0] == '\0') {
+                        printf("(This name will be reused for rematches)\n> ");
+                        fflush(stdout);
+                        if (fgets(input, sizeof(input), stdin) == NULL) {
+                            break;
+                        }
+                        input[strcspn(input, "\n")] = '\0';
+                        strncpy(saved_name, input, sizeof(saved_name) - 1);
+                        saved_name[sizeof(saved_name) - 1] = '\0';
+                    }
+
+                    char line[128];
+                    snprintf(line, sizeof(line), "%s\n", saved_name);
+                    if (write(write_fd, line, strlen(line)) < 0) {
+                        perror("Send failed");
+                        break;
+                    }
+                    continue;
+                }
+
+                // Otherwise, normal interactive input
                 if (fgets(input, sizeof(input), stdin) != NULL) {
-                    // Send to server
                     if (write(write_fd, input, strlen(input)) < 0) {
                         perror("Send failed");
                         break;
