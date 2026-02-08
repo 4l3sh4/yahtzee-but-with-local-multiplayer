@@ -28,7 +28,7 @@ int main() {
     printf("╚═══════════════════════════════════════╝\n");
     printf("\n");
     
-    // Create unique FIFO names for this client
+    // Create unique FIFO names for client
     snprintf(client_write_fifo, sizeof(client_write_fifo), 
              "%s/client_%d", FIFO_DIR, getpid());
     snprintf(client_read_fifo, sizeof(client_read_fifo), 
@@ -91,7 +91,7 @@ int main() {
 
         int saw_game_over = 0;
 
-        // Main communication loop (single game)
+        // Main communication loop for single game
         while (1) {
         memset(buffer, 0, BUFFER_SIZE);
         int n = read(read_fd, buffer, BUFFER_SIZE - 1);
@@ -170,7 +170,7 @@ int main() {
         close(read_fd);
         close(write_fd);
 
-        // Ask for rematch if we reached game over (or if server disconnected after the match)
+        // Ask for rematch if we reached game over or if server disconnected after the match
         if (saw_game_over) {
             printf("\nPlay again? (Y/N): ");
             fflush(stdout);
@@ -181,7 +181,7 @@ int main() {
             }
         }
 
-        break; // no rematch
+        break; 
     }
     
     printf("\n");
